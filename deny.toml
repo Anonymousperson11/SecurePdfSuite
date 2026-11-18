@@ -1,0 +1,42 @@
+[graph]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "deny"
+# Also gate duplicates that only appear through dev-dependencies (cargo-deny ignores them by
+# default, which is why two `windows-link` versions in Cargo.lock went unnoticed).
+multiple-versions-include-dev = true
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+skip = [
+    { crate = "miniz_oxide@0.8.9", reason = "Required transitively by png 0.18.1 alongside image 0.25.10" },
+    { crate = "windows-link@0.2.1", reason = "Test-only: tempfile (dev-dependency) -> windows-sys 0.61 pins windows-link 0.2; shipped binaries link only windows-link 0.100" },
+]
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

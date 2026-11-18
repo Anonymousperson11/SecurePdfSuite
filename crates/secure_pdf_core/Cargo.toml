@@ -1,0 +1,20 @@
+[package]
+name = "secure_pdf_core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core cryptography, .spdf container, quota state machine, PDFium renderer, printing guard, and watermark forensics"
+
+[dependencies]
+image.workspace = true
+windows-core.workspace = true
+windows-result.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

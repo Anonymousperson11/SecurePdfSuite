@@ -1,0 +1,27 @@
+[package]
+name = "secure_pdf_creator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Native WinUI 3 Creator tool for .spdf encryption and anti-leak watermark forensics"
+
+[[bin]]
+name = "SecurePdfCreator"
+path = "src/main.rs"
+
+[dependencies]
+image.workspace = true
+secure_pdf_core.workspace = true
+windows-collections.workspace = true
+windows-core.workspace = true
+windows-future.workspace = true
+windows-numerics.workspace = true
+winui3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "winui3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Pure native WinUI 3 windows-rs bindings, dynamic dependency bootstrapper, and safe ergonomic Fluent UI wrappers"
+
+[dependencies]
+windows-collections.workspace = true
+windows-core.workspace = true
+windows-future.workspace = true
+windows-implement.workspace = true
+windows-numerics.workspace = true
+windows-reference.workspace = true
+windows-result.workspace = true
+windows-threading.workspace = true
+windows-time.workspace = true
+
+[lints]
+workspace = true

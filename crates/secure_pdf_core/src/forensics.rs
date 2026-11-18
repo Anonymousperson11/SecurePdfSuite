@@ -1,0 +1,1039 @@
+//! O(W) sliding-window anti-leak watermark forensics enhancement and EXIF orientation normalization.
+
+use std::fs;
+use std::path::Path;
+
+use image::{DynamicImage, GenericImageView, ImageFormat, RgbaImage};
+
+use crate::error::{CoreError, CoreResult};
+
+/// Maximum pixel count that takes part in forensics processing (50M px).
+///
+/// Larger photos (100 MP / 200 MP phone captures) are scaled down proportionally on load; the
+/// screen content they show has far less effective resolution than that.
+pub const MAX_FORENSICS_PIXELS: usize = 50_000_000;
+
+/// Hard ceiling on the encoded image size that will be decoded at all (250M px).
+pub const MAX_DECODE_PIXELS: usize = 250_000_000;
+
+/// Forensics enhancement filter mode matching `SecurePdf.Core.WatermarkEnhancer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EnhanceMode {
+    /// Isolates yellow-green camera chroma modulation (`3*(B-R) + (B-G)`) inside an `r=18` window.
+    #[default]
+    ChromaStegoExtract,
+    /// Removes smooth paper/screen illumination locally via `r=15` sliding window luminance mean.
+    AdaptiveBackgroundSubtract,
+    /// Applies global 256-bin luminance histogram equalization followed by contrast inversion.
+    GlobalEqualizeAndInvert,
+}
+
+/// Decoded or enhanced upright pixel image buffer (`width * height * 4` bytes).
+#[derive(Debug, Clone)]
+pub struct ForensicsImage {
+    /// Image width in pixels.
+    pub width: u32,
+    /// Image height in pixels.
+    pub height: u32,
+    /// Straight `RGBA8` pixels (`width * height * 4`) for generic encoding / PNG save.
+    pub rgba: Vec<u8>,
+}
+
+impl ForensicsImage {
+    /// Converts straight `RGBA8` pixels into premultiplied `BGRA8` bytes for `WinUI 3` `WriteableBitmap`.
+    #[must_use]
+    pub fn to_bgra8(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.rgba.len());
+        for px in self.rgba.as_chunks::<4>().0 {
+            out.extend_from_slice(&rgba_to_premultiplied_bgra(*px));
+        }
+        out
+    }
+}
+
+/// Rounded `channel * alpha / 255 + white * (255 - alpha) / 255` style 8-bit blend.
+fn blend_channel(channel: u8, alpha: u8, backdrop: u8) -> u8 {
+    let a = u16::from(alpha);
+    let value = (u16::from(channel) * a + u16::from(backdrop) * (255 - a) + 127) / 255;
+    u8::try_from(value).unwrap_or(u8::MAX)
+}
+
+/// Converts one straight `RGBA8` pixel into a premultiplied `BGRA8` pixel.
+#[must_use]
+pub fn rgba_to_premultiplied_bgra(px: [u8; 4]) -> [u8; 4] {
+    let [r, g, b, alpha] = px;
+    if alpha == 255 {
+        return [b, g, r, 255];
+    }
+    [
+        blend_channel(b, alpha, 0),
+        blend_channel(g, alpha, 0),
+        blend_channel(r, alpha, 0),
+        alpha,
+    ]
+}
+
+/// Colour of a straight `RGBA8` pixel as seen on a white page (transparent areas become white).
+#[inline]
+fn composite_on_white(px: [u8; 4]) -> [u8; 3] {
+    let [r, g, b, alpha] = px;
+    if alpha == 255 {
+        return [r, g, b];
+    }
+    [
+        blend_channel(r, alpha, 255),
+        blend_channel(g, alpha, 255),
+        blend_channel(b, alpha, 255),
+    ]
+}
+
+/// Loads `path` into memory and returns an upright, opaque [`ForensicsImage`].
+///
+/// Honors EXIF orientation tag `0x0112`, scales images above [`MAX_FORENSICS_PIXELS`] down
+/// proportionally and flattens transparency onto white.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Forensics`] on invalid images, unsupported formats, or images above
+/// [`MAX_DECODE_PIXELS`], and [`CoreError::Io`] when the file cannot be read.
+pub fn load_image_upright(path: &Path) -> CoreResult<ForensicsImage> {
+    let bytes = fs::read(path)?;
+    load_image_bytes_upright(&bytes)
+}
+
+/// Decodes raw encoded image bytes (`PNG`, `JPEG`, `BMP`, `TIFF`, `GIF`) into an upright,
+/// opaque [`ForensicsImage`] (see [`load_image_upright`]).
+///
+/// # Errors
+///
+/// Returns [`CoreError::Forensics`] if decoding fails or the image exceeds [`MAX_DECODE_PIXELS`].
+pub fn load_image_bytes_upright(bytes: &[u8]) -> CoreResult<ForensicsImage> {
+    load_image_bytes_with_budget(bytes, MAX_FORENSICS_PIXELS)
+}
+
+/// Target size for an image that must fit `max_pixels`, keeping the aspect ratio (v1.x rule:
+/// scale both sides by `sqrt(max / total)`), never below 1 px and never above the budget.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn fit_within_pixel_budget(width: u32, height: u32, max_pixels: usize) -> (u32, u32) {
+    let total = u64::from(width) * u64::from(height);
+    let budget = u64::try_from(max_pixels).unwrap_or(u64::MAX).max(1);
+    if total <= budget {
+        return (width, height);
+    }
+    let scale = (budget as f64 / total as f64).sqrt();
+    let mut tw = ((f64::from(width) * scale).round() as u32).max(1);
+    let mut th = ((f64::from(height) * scale).round() as u32).max(1);
+    // Rounding both sides up can overshoot the budget by a sliver; trim the longer side.
+    while u64::from(tw) * u64::from(th) > budget {
+        if tw >= th && tw > 1 {
+            tw -= 1;
+        } else if th > 1 {
+            th -= 1;
+        } else {
+            break;
+        }
+    }
+    (tw, th)
+}
+
+fn load_image_bytes_with_budget(bytes: &[u8], max_pixels: usize) -> CoreResult<ForensicsImage> {
+    let orientation = parse_exif_orientation(bytes).unwrap_or(1);
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| CoreError::Forensics(format!("无法识别图片格式：{e}")))?;
+
+    let (src_w, src_h) = reader
+        .into_dimensions()
+        .map_err(|e| CoreError::Forensics(format!("无法读取图片尺寸：{e}")))?;
+    let total_px = usize::try_from(src_w)
+        .ok()
+        .and_then(|wi| {
+            usize::try_from(src_h)
+                .ok()
+                .and_then(|hi| wi.checked_mul(hi))
+        })
+        .ok_or_else(|| CoreError::Forensics("图片尺寸整数溢出。".to_owned()))?;
+    if total_px == 0 {
+        return Err(CoreError::Forensics(format!(
+            "图片尺寸无效（{src_w}x{src_h}）。"
+        )));
+    }
+    if total_px > MAX_DECODE_PIXELS {
+        return Err(CoreError::Forensics(format!(
+            "图片过大（{src_w}x{src_h}），超出可处理的 2.5 亿像素上限。"
+        )));
+    }
+
+    let mut image_reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| CoreError::Forensics(format!("读取图片格式失败：{e}")))?;
+    // The pixel count is already bounded above; lift the library's default 512 MiB allocation
+    // cap so that legitimate 100-200 MP photos can be decoded before being scaled down.
+    let mut limits = image::Limits::default();
+    limits.max_alloc = None;
+    image_reader.limits(limits);
+    let decoded = image_reader
+        .decode()
+        .map_err(|e| CoreError::Forensics(format!("图片解码失败：{e}")))?;
+
+    let (tw, th) = fit_within_pixel_budget(src_w, src_h, max_pixels);
+    let sized = if (tw, th) == (src_w, src_h) {
+        decoded
+    } else {
+        // Area-averaging reduction: linear time and well suited to pure down-scaling.
+        decoded.thumbnail_exact(tw, th)
+    };
+
+    let oriented = apply_exif_orientation(sized, orientation);
+    let (ow, oh) = oriented.dimensions();
+    let mut rgba = oriented.into_rgba8().into_raw();
+    for px in rgba.as_chunks_mut::<4>().0 {
+        let flat = composite_on_white(*px);
+        *px = [flat[0], flat[1], flat[2], 255];
+    }
+    Ok(ForensicsImage {
+        width: ow,
+        height: oh,
+        rgba,
+    })
+}
+
+/// Applies the requested forensic watermark enhancement algorithm to `src`.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Forensics`] if `src` buffer dimensions are inconsistent or exceed 50M px.
+pub fn enhance_image(src: &ForensicsImage, mode: EnhanceMode) -> CoreResult<ForensicsImage> {
+    let w = usize::try_from(src.width)
+        .map_err(|_| CoreError::Forensics("图片宽度溢出。".to_owned()))?;
+    let h = usize::try_from(src.height)
+        .map_err(|_| CoreError::Forensics("图片高度溢出。".to_owned()))?;
+    let count = w
+        .checked_mul(h)
+        .ok_or_else(|| CoreError::Forensics("图片像素总数溢出。".to_owned()))?;
+    if count == 0 || count > MAX_FORENSICS_PIXELS {
+        return Err(CoreError::Forensics(
+            "图片尺寸非法或超出 50M 像素上限。".to_owned(),
+        ));
+    }
+    if src.rgba.len() != count * 4 {
+        return Err(CoreError::Forensics(
+            "输入像素缓冲区长度与宽高不匹配。".to_owned(),
+        ));
+    }
+
+    let out_rgba = match mode {
+        EnhanceMode::ChromaStegoExtract => {
+            enhance_local_window(src, 18, 11.0, 0.25, 225.0, chroma_stego_signal)
+        }
+        EnhanceMode::AdaptiveBackgroundSubtract => {
+            enhance_local_window(src, 15, 9.0, 1.0 / 256.0, 128.0, luminance_weighted_signal)
+        }
+        EnhanceMode::GlobalEqualizeAndInvert => enhance_global_equalize_invert(src),
+    };
+
+    Ok(ForensicsImage {
+        width: src.width,
+        height: src.height,
+        rgba: out_rgba,
+    })
+}
+
+/// Saves `img` cleanly as a lossless PNG file at `path`.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Forensics`] or [`CoreError::Io`] if encoding or writing fails.
+pub fn save_png(path: &Path, img: &ForensicsImage) -> CoreResult<()> {
+    let rgba_buf =
+        RgbaImage::from_raw(img.width, img.height, img.rgba.clone()).ok_or_else(|| {
+            CoreError::Forensics("图片像素尺寸与缓冲区不一致，无法保存 PNG。".to_owned())
+        })?;
+    let mut file = fs::File::create(path)?;
+    rgba_buf
+        .write_to(&mut file, ImageFormat::Png)
+        .map_err(|e| CoreError::Forensics(format!("PNG 编码导出失败：{e}")))?;
+    Ok(())
+}
+
+#[inline]
+const fn chroma_stego_signal(r: i32, g: i32, b: i32) -> i32 {
+    3 * (b - r) + (b - g)
+}
+
+#[inline]
+const fn luminance_weighted_signal(r: i32, g: i32, b: i32) -> i32 {
+    r * 77 + g * 150 + b * 29
+}
+
+/// O(W) memory, O(W*H) time 2D sliding-window background subtraction matching `WatermarkEnhancer`.
+fn enhance_local_window(
+    src: &ForensicsImage,
+    radius: usize,
+    gain: f64,
+    signal_unit: f64,
+    base_val: f64,
+    signal_fn: fn(i32, i32, i32) -> i32,
+) -> Vec<u8> {
+    let w = src.width as usize;
+    let h = src.height as usize;
+
+    let mut row_signal = vec![0_i32; w];
+    let mut row_pref = vec![0_i64; w + 1];
+    let mut ring_rows = vec![vec![0_i64; w]; (2 * radius + 2).min(h + 1)];
+    let mut col_sums = vec![0_i64; w];
+    let mut col_counts = vec![0_i32; w];
+
+    let init_rows = radius.min(h);
+    for y in 0..init_rows {
+        fill_row_signal(
+            &src.rgba[y * w * 4..(y + 1) * w * 4],
+            &mut row_signal,
+            signal_fn,
+        );
+        let slot = y % ring_rows.len();
+        for x in 0..w {
+            let v = i64::from(row_signal[x]);
+            ring_rows[slot][x] = v;
+            col_sums[x] += v;
+            col_counts[x] += 1;
+        }
+    }
+
+    let mut out = vec![0xFF_u8; src.rgba.len()];
+    let ring_len = ring_rows.len();
+
+    for y in 0..h {
+        let enter_y = y + radius;
+        if enter_y < h {
+            fill_row_signal(
+                &src.rgba[enter_y * w * 4..(enter_y + 1) * w * 4],
+                &mut row_signal,
+                signal_fn,
+            );
+            let slot = enter_y % ring_len;
+            for x in 0..w {
+                let v = i64::from(row_signal[x]);
+                ring_rows[slot][x] = v;
+                col_sums[x] += v;
+                col_counts[x] += 1;
+            }
+        }
+
+        if let Some(leave_y) = y.checked_sub(radius + 1) {
+            let slot = leave_y % ring_len;
+            for x in 0..w {
+                col_sums[x] -= ring_rows[slot][x];
+                col_counts[x] -= 1;
+            }
+        }
+
+        fill_row_signal(
+            &src.rgba[y * w * 4..(y + 1) * w * 4],
+            &mut row_signal,
+            signal_fn,
+        );
+        row_pref[0] = 0;
+        for x in 0..w {
+            row_pref[x + 1] = row_pref[x] + col_sums[x];
+        }
+
+        let dst_row = &mut out[y * w * 4..(y + 1) * w * 4];
+        for x in 0..w {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius).min(w - 1);
+            let window_sum = row_pref[x1 + 1] - row_pref[x0];
+            let area = i64::from(col_counts[x]) * i64::try_from(x1 - x0 + 1).unwrap_or(1);
+            #[allow(clippy::cast_precision_loss)]
+            let local_mean = (window_sum as f64 * signal_unit) / (area.max(1) as f64);
+            let val = f64::from(row_signal[x]) * signal_unit;
+            let diff = -(val - local_mean);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let mapped = diff.mul_add(gain, base_val).round().clamp(0.0, 255.0) as u8;
+            let base_idx = x * 4;
+            dst_row[base_idx] = mapped;
+            dst_row[base_idx + 1] = mapped;
+            dst_row[base_idx + 2] = mapped;
+            dst_row[base_idx + 3] = 255;
+        }
+    }
+
+    out
+}
+
+fn fill_row_signal(src_row: &[u8], out: &mut [i32], signal_fn: fn(i32, i32, i32) -> i32) {
+    for (dst, px) in out.iter_mut().zip(src_row.as_chunks::<4>().0) {
+        // Transparent areas are evaluated as they would appear on a white page.
+        let [r, g, b] = composite_on_white(*px);
+        *dst = signal_fn(i32::from(r), i32::from(g), i32::from(b));
+    }
+}
+
+/// 8-bit luminance (`77 R + 150 G + 29 B`) of a pixel flattened onto white.
+fn luma_on_white(px: [u8; 4]) -> usize {
+    let [r, g, b] = composite_on_white(px);
+    let luma = (u32::from(r) * 77 + u32::from(g) * 150 + u32::from(b) * 29) >> 8;
+    usize::try_from(luma.min(255)).unwrap_or(255)
+}
+
+fn enhance_global_equalize_invert(src: &ForensicsImage) -> Vec<u8> {
+    let total = (src.width as usize) * (src.height as usize);
+    let mut hist = [0_u64; 256];
+
+    for px in src.rgba.as_chunks::<4>().0 {
+        hist[luma_on_white(*px)] += 1;
+    }
+
+    let mut cdf = [0_u64; 256];
+    let mut acc = 0_u64;
+    let mut cdf_min = None;
+    for i in 0..256 {
+        acc += hist[i];
+        cdf[i] = acc;
+        if hist[i] > 0 && cdf_min.is_none() {
+            cdf_min = Some(acc);
+        }
+    }
+
+    let total_u64 = u64::try_from(total).unwrap_or(1);
+    let min_c = cdf_min.unwrap_or(0);
+    let denom = total_u64.saturating_sub(min_c);
+
+    let mut lut = [0_u8; 256];
+    for i in 0..256 {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let eq = if denom == 0 {
+            u8::try_from(i).unwrap_or(0)
+        } else {
+            (((cdf[i].saturating_sub(min_c)) as f64 / denom as f64) * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        lut[i] = 255 - eq;
+    }
+
+    let mut out = vec![0xFF_u8; src.rgba.len()];
+    for (dst, px) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.rgba.as_chunks::<4>().0)
+    {
+        let v = lut[luma_on_white(*px)];
+        dst[0] = v;
+        dst[1] = v;
+        dst[2] = v;
+        dst[3] = 255;
+    }
+    out
+}
+
+fn apply_exif_orientation(img: DynamicImage, orientation: u16) -> DynamicImage {
+    match orientation {
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        5 => img.rotate90().fliph(),
+        6 => img.rotate90(),
+        7 => img.rotate270().fliph(),
+        8 => img.rotate270(),
+        _ => img,
+    }
+}
+
+/// Parses EXIF Orientation tag (`0x0112`) directly from JPEG APP1 or TIFF header bytes.
+fn parse_exif_orientation(data: &[u8]) -> Option<u16> {
+    if data.starts_with(b"\xFF\xD8") {
+        let mut i = 2_usize;
+        while i + 4 <= data.len() {
+            if data[i] != 0xFF {
+                break;
+            }
+            let marker = data[i + 1];
+            i += 2;
+            if marker == 0xD9 || marker == 0xDA {
+                break;
+            }
+            if (0xD0..=0xD7).contains(&marker) || marker == 0x01 || marker == 0x00 {
+                continue;
+            }
+            let seg_len = usize::from(u16::from_be_bytes([*data.get(i)?, *data.get(i + 1)?]));
+            if seg_len < 2 || i + seg_len > data.len() {
+                break;
+            }
+            let payload = &data[i + 2..i + seg_len];
+            if marker == 0xE1 && payload.starts_with(b"Exif\0\0") {
+                return parse_tiff_ifd_orientation(&payload[6..]);
+            }
+            i += seg_len;
+        }
+        None
+    } else {
+        parse_tiff_ifd_orientation(data)
+    }
+}
+
+fn parse_tiff_ifd_orientation(tiff: &[u8]) -> Option<u16> {
+    if tiff.len() < 8 {
+        return None;
+    }
+    let little = match &tiff[0..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let read_u16 = |off: usize| -> Option<u16> {
+        let s = tiff.get(off..off + 2)?;
+        Some(if little {
+            u16::from_le_bytes([s[0], s[1]])
+        } else {
+            u16::from_be_bytes([s[0], s[1]])
+        })
+    };
+    let read_u32 = |off: usize| -> Option<u32> {
+        let s = tiff.get(off..off + 4)?;
+        Some(if little {
+            u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+        } else {
+            u32::from_be_bytes([s[0], s[1], s[2], s[3]])
+        })
+    };
+
+    if read_u16(2)? != 42 {
+        return None;
+    }
+    let ifd_off = usize::try_from(read_u32(4)?).ok()?;
+    let count = usize::from(read_u16(ifd_off)?);
+    for idx in 0..count {
+        let entry = ifd_off.checked_add(2)?.checked_add(idx * 12)?;
+        let tag = read_u16(entry)?;
+        if tag == 0x0112 {
+            let val = read_u16(entry + 8)?;
+            return Some(val);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chroma_stego_extract_amplifies_faint_blue_channel_stego_text() {
+        // Uniform neutral gray background (160, 160, 160) with a subtle delta B=+3, R=-2 ridge
+        let w = 80_u32;
+        let h = 60_u32;
+        let mut rgba = vec![160_u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let idx = ((y * w + x) * 4) as usize;
+                rgba[idx + 3] = 255;
+                if (28..=30).contains(&y) && (20..=55).contains(&x) {
+                    rgba[idx] = 158; // R
+                    rgba[idx + 1] = 160; // G
+                    rgba[idx + 2] = 163; // B
+                }
+            }
+        }
+        let img = ForensicsImage {
+            width: w,
+            height: h,
+            rgba,
+        };
+        let enhanced = enhance_image(&img, EnhanceMode::ChromaStegoExtract).unwrap();
+
+        let bg_luma = enhanced.rgba[0];
+        let stego_luma = enhanced.rgba[((29 * w + 35) * 4) as usize];
+        // Stego stripe must darken strongly relative to paper baseline (~225)
+        assert!(bg_luma >= 215);
+        assert!(stego_luma < bg_luma.saturating_sub(40));
+    }
+
+    #[test]
+    fn adaptive_background_and_global_eq_work_cleanly_and_save_png() {
+        let w = 64_u32;
+        let h = 48_u32;
+        let mut rgba = vec![235_u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let idx = ((y * w + x) * 4) as usize;
+                rgba[idx + 3] = 255;
+                if y == 24 {
+                    rgba[idx] = 210;
+                    rgba[idx + 1] = 210;
+                    rgba[idx + 2] = 210;
+                }
+            }
+        }
+        let img = ForensicsImage {
+            width: w,
+            height: h,
+            rgba,
+        };
+        let sub = enhance_image(&img, EnhanceMode::AdaptiveBackgroundSubtract).unwrap();
+        let eq = enhance_image(&img, EnhanceMode::GlobalEqualizeAndInvert).unwrap();
+        assert_ne!(sub.rgba[((24 * w + 32) * 4) as usize], sub.rgba[0]);
+        assert!(eq.rgba[((24 * w + 32) * 4) as usize] > eq.rgba[0]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_png = dir.path().join("enhanced.png");
+        save_png(&out_png, &sub).unwrap();
+        let reloaded = load_image_upright(&out_png).unwrap();
+        assert_eq!(reloaded.width, w);
+        assert_eq!(reloaded.height, h);
+    }
+
+    /// Minimal TIFF header carrying only the Orientation tag, in either byte order.
+    fn tiff_with_orientation(orientation: u16, little_endian: bool) -> Vec<u8> {
+        let u16b = |v: u16| {
+            if little_endian {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        };
+        let u32b = |v: u32| {
+            if little_endian {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        };
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(if little_endian { b"II" } else { b"MM" });
+        tiff.extend_from_slice(&u16b(42));
+        tiff.extend_from_slice(&u32b(8));
+        tiff.extend_from_slice(&u16b(1)); // 1 IFD entry
+        tiff.extend_from_slice(&u16b(0x0112)); // Orientation
+        tiff.extend_from_slice(&u16b(3)); // SHORT
+        tiff.extend_from_slice(&u32b(1)); // count
+        tiff.extend_from_slice(&u16b(orientation));
+        tiff.extend_from_slice(&u16b(0));
+        tiff.extend_from_slice(&u32b(0)); // next IFD
+        tiff
+    }
+
+    #[test]
+    fn exif_tiff_orientation_rotates_6_90cw_and_8_270cw() {
+        assert_eq!(
+            parse_exif_orientation(&tiff_with_orientation(6, true)),
+            Some(6)
+        );
+        assert_eq!(
+            parse_exif_orientation(&tiff_with_orientation(8, true)),
+            Some(8)
+        );
+        assert_eq!(
+            parse_exif_orientation(&tiff_with_orientation(8, false)),
+            Some(8)
+        );
+        assert_eq!(parse_exif_orientation(b"II*\0"), None);
+        assert_eq!(parse_exif_orientation(b"not an image at all"), None);
+    }
+
+    /// Encodes a real baseline JPEG and splices a genuine APP1 `Exif` segment after SOI.
+    fn jpeg_with_exif_orientation(
+        img: &image::RgbImage,
+        orientation: u16,
+        little_endian: bool,
+    ) -> Vec<u8> {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .encode_image(img)
+            .unwrap();
+        assert!(jpeg.starts_with(b"\xFF\xD8"));
+
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&tiff_with_orientation(orientation, little_endian));
+        let seg_len = u16::try_from(payload.len() + 2).unwrap();
+
+        let mut out = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        out.extend_from_slice(&seg_len.to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    /// 32x16 picture: left half pure red, right half pure blue.
+    fn red_left_blue_right() -> image::RgbImage {
+        image::RgbImage::from_fn(32, 16, |x, _| {
+            if x < 16 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            }
+        })
+    }
+
+    fn pixel(img: &ForensicsImage, x: u32, y: u32) -> [u8; 4] {
+        let idx = ((y * img.width + x) * 4) as usize;
+        [
+            img.rgba[idx],
+            img.rgba[idx + 1],
+            img.rgba[idx + 2],
+            img.rgba[idx + 3],
+        ]
+    }
+
+    fn is_red(px: [u8; 4]) -> bool {
+        px[0] > 180 && px[2] < 80
+    }
+
+    fn is_blue(px: [u8; 4]) -> bool {
+        px[2] > 180 && px[0] < 80
+    }
+
+    #[test]
+    fn jpeg_app1_exif_orientation_8_rotates_pixels_270_degrees_clockwise() {
+        let jpeg = jpeg_with_exif_orientation(&red_left_blue_right(), 8, true);
+        assert_eq!(parse_exif_orientation(&jpeg), Some(8));
+
+        let upright = load_image_bytes_upright(&jpeg).unwrap();
+        // 32x16 landscape becomes 16x32 portrait.
+        assert_eq!((upright.width, upright.height), (16, 32));
+        // Rotating 270 degrees clockwise moves the right (blue) half to the top and the left
+        // (red) half to the bottom.
+        for x in [2, 8, 13] {
+            assert!(
+                is_blue(pixel(&upright, x, 3)),
+                "{:?}",
+                pixel(&upright, x, 3)
+            );
+            assert!(
+                is_red(pixel(&upright, x, 28)),
+                "{:?}",
+                pixel(&upright, x, 28)
+            );
+        }
+    }
+
+    #[test]
+    fn jpeg_app1_exif_orientation_6_big_endian_rotates_pixels_90_degrees_clockwise() {
+        let jpeg = jpeg_with_exif_orientation(&red_left_blue_right(), 6, false);
+        assert_eq!(parse_exif_orientation(&jpeg), Some(6));
+
+        let upright = load_image_bytes_upright(&jpeg).unwrap();
+        assert_eq!((upright.width, upright.height), (16, 32));
+        // Rotating 90 degrees clockwise moves the left (red) half to the top.
+        for x in [2, 8, 13] {
+            assert!(is_red(pixel(&upright, x, 3)));
+            assert!(is_blue(pixel(&upright, x, 28)));
+        }
+    }
+
+    #[test]
+    fn jpeg_without_exif_or_with_other_app_segments_keeps_its_orientation() {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .encode_image(&red_left_blue_right())
+            .unwrap();
+        assert_eq!(parse_exif_orientation(&jpeg), None);
+        let plain = load_image_bytes_upright(&jpeg).unwrap();
+        assert_eq!((plain.width, plain.height), (32, 16));
+        assert!(is_red(pixel(&plain, 3, 8)));
+        assert!(is_blue(pixel(&plain, 28, 8)));
+
+        // An APP1 segment that is not Exif (e.g. XMP) must be skipped, not misparsed.
+        let mut xmp = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x0A];
+        xmp.extend_from_slice(b"http://x");
+        xmp.extend_from_slice(&jpeg[2..]);
+        assert_eq!(parse_exif_orientation(&xmp), None);
+    }
+
+    /// Maps a stored pixel `(x, y)` of a `w` x `h` image to its upright position.
+    type Map = fn(u32, u32, u32, u32) -> (u32, u32);
+
+    #[test]
+    fn every_exif_orientation_maps_pixels_to_the_position_the_standard_defines() {
+        // 3 wide x 2 high with a unique value per pixel: value = 10 * y + x.
+        let (w, h) = (3_u32, 2_u32);
+        let src = RgbaImage::from_fn(w, h, |x, y| {
+            image::Rgba([u8::try_from(10 * y + x).unwrap(), 0, 0, 255])
+        });
+        // (orientation, upright size, where stored pixel (x, y) must end up)
+        let cases: [(u16, (u32, u32), Map); 8] = [
+            (1, (3, 2), |x, y, _, _| (x, y)),
+            (2, (3, 2), |x, y, w, _| (w - 1 - x, y)),
+            (3, (3, 2), |x, y, w, h| (w - 1 - x, h - 1 - y)),
+            (4, (3, 2), |x, y, _, h| (x, h - 1 - y)),
+            (5, (2, 3), |x, y, _, _| (y, x)),
+            (6, (2, 3), |x, y, _, h| (h - 1 - y, x)),
+            (7, (2, 3), |x, y, w, h| (h - 1 - y, w - 1 - x)),
+            (8, (2, 3), |x, y, w, _| (y, w - 1 - x)),
+        ];
+        for (orientation, size, map) in cases {
+            let out = apply_exif_orientation(DynamicImage::ImageRgba8(src.clone()), orientation)
+                .into_rgba8();
+            assert_eq!(out.dimensions(), size, "orientation {orientation}");
+            for y in 0..h {
+                for x in 0..w {
+                    let (dx, dy) = map(x, y, w, h);
+                    assert_eq!(
+                        out.get_pixel(dx, dy)[0],
+                        u8::try_from(10 * y + x).unwrap(),
+                        "orientation {orientation}: stored ({x},{y}) -> upright ({dx},{dy})"
+                    );
+                }
+            }
+        }
+    }
+
+    fn encode_png(img: &RgbaImage) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn pixel_budget_fit_keeps_aspect_ratio_and_never_exceeds_the_budget() {
+        assert_eq!(
+            fit_within_pixel_budget(4_000, 3_000, 50_000_000),
+            (4_000, 3_000)
+        );
+        // 200 MP (16320 x 12240) -> at most 50 MP with the same 4:3 shape.
+        let (w, h) = fit_within_pixel_budget(16_320, 12_240, MAX_FORENSICS_PIXELS);
+        assert!(u64::from(w) * u64::from(h) <= 50_000_000);
+        assert!(u64::from(w) * u64::from(h) > 49_900_000);
+        assert!((f64::from(w) / f64::from(h) - 4.0 / 3.0).abs() < 0.001);
+        // Degenerate shapes stay at least one pixel on each side and inside the budget.
+        for (iw, ih, budget) in [
+            (1_000_000, 1, 1_000),
+            (1, 1_000_000, 1_000),
+            (7, 7, 1),
+            (3, 5, 14),
+        ] {
+            let (fw, fh) = fit_within_pixel_budget(iw, ih, budget);
+            assert!(fw >= 1 && fh >= 1);
+            assert!(u64::from(fw) * u64::from(fh) <= u64::try_from(budget).unwrap());
+        }
+    }
+
+    #[test]
+    fn images_above_the_pixel_budget_are_scaled_down_instead_of_rejected() {
+        // 400x200 (80 000 px) against a 20 000 px budget -> exactly half size on each side.
+        let src = RgbaImage::from_fn(400, 200, |x, _| {
+            if x < 200 {
+                image::Rgba([250, 250, 250, 255])
+            } else {
+                image::Rgba([20, 20, 20, 255])
+            }
+        });
+        let png = encode_png(&src);
+        let small = load_image_bytes_with_budget(&png, 20_000).unwrap();
+        assert_eq!((small.width, small.height), (200, 100));
+        assert_eq!(small.rgba.len(), 200 * 100 * 4);
+        // Content survives the resize: light left half, dark right half.
+        assert!(pixel(&small, 40, 50)[0] > 230);
+        assert!(pixel(&small, 160, 50)[0] < 40);
+        // The scaled result is accepted by the enhancer.
+        assert!(enhance_image(&small, EnhanceMode::GlobalEqualizeAndInvert).is_ok());
+
+        // Within budget: untouched.
+        let same = load_image_bytes_with_budget(&png, 80_000).unwrap();
+        assert_eq!((same.width, same.height), (400, 200));
+    }
+
+    #[test]
+    fn real_image_just_above_50_megapixels_is_loaded_and_reduced_to_the_limit() {
+        // 8200 x 6200 = 50.84 MP, written directly as an uncompressed 8-bit greyscale BMP so
+        // the test does not spend its time in an encoder.
+        let (w, h) = (8_200_u32, 6_200_u32);
+        let row_len = w as usize; // already a multiple of four, so rows need no padding
+        let pixel_offset = 14 + 40 + 256 * 4;
+        let mut bytes = Vec::with_capacity(pixel_offset + row_len * h as usize);
+        bytes.extend_from_slice(b"BM");
+        bytes.extend_from_slice(&0_u32.to_le_bytes()); // file size (ignored by decoders)
+        bytes.extend_from_slice(&0_u32.to_le_bytes()); // reserved
+        bytes.extend_from_slice(&u32::try_from(pixel_offset).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&40_u32.to_le_bytes()); // BITMAPINFOHEADER
+        bytes.extend_from_slice(&i32::try_from(w).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&i32::try_from(h).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes()); // planes
+        bytes.extend_from_slice(&8_u16.to_le_bytes()); // bits per pixel
+        bytes.extend_from_slice(&[0_u8; 24]); // BI_RGB, sizes, resolution, palette counts
+        for level in 0..=255_u8 {
+            bytes.extend_from_slice(&[level, level, level, 0]);
+        }
+        let mut row = vec![16_u8; row_len];
+        row[..row_len / 2].fill(240);
+        for _ in 0..h {
+            bytes.extend_from_slice(&row);
+        }
+
+        let loaded = load_image_bytes_upright(&bytes).unwrap();
+        let total = u64::from(loaded.width) * u64::from(loaded.height);
+        assert!(total <= 50_000_000, "{} x {}", loaded.width, loaded.height);
+        assert!(total > 49_900_000, "{} x {}", loaded.width, loaded.height);
+        assert!(loaded.width < w && loaded.height < h);
+        let ratio = f64::from(loaded.width) / f64::from(loaded.height);
+        assert!((ratio - f64::from(w) / f64::from(h)).abs() < 0.001);
+        assert!(pixel(&loaded, loaded.width / 4, loaded.height / 2)[0] > 220);
+        assert!(pixel(&loaded, loaded.width * 3 / 4, loaded.height / 2)[0] < 40);
+    }
+
+    #[test]
+    fn absurdly_large_headers_are_rejected_before_any_pixel_is_decoded() {
+        // A BMP header that claims 20000 x 20000 (400 MP) with no pixel data behind it.
+        let mut bmp = Vec::new();
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&0_u32.to_le_bytes()); // file size (ignored)
+        bmp.extend_from_slice(&0_u32.to_le_bytes()); // reserved
+        bmp.extend_from_slice(&54_u32.to_le_bytes()); // pixel data offset
+        bmp.extend_from_slice(&40_u32.to_le_bytes()); // BITMAPINFOHEADER
+        bmp.extend_from_slice(&20_000_i32.to_le_bytes());
+        bmp.extend_from_slice(&20_000_i32.to_le_bytes());
+        bmp.extend_from_slice(&1_u16.to_le_bytes()); // planes
+        bmp.extend_from_slice(&24_u16.to_le_bytes()); // bpp
+        bmp.extend_from_slice(&[0_u8; 24]);
+        let err = load_image_bytes_upright(&bmp).unwrap_err();
+        assert!(err.to_string().contains("上限"), "{err}");
+    }
+
+    #[test]
+    fn transparent_pixels_are_flattened_onto_white_and_previews_are_premultiplied() {
+        let src = RgbaImage::from_fn(4, 1, |x, _| match x {
+            0 => image::Rgba([0, 0, 0, 0]),        // fully transparent black
+            1 => image::Rgba([0, 0, 0, 255]),      // opaque black
+            2 => image::Rgba([200, 100, 50, 128]), // half transparent
+            _ => image::Rgba([10, 20, 30, 255]),
+        });
+        let loaded = load_image_bytes_upright(&encode_png(&src)).unwrap();
+        assert_eq!(pixel(&loaded, 0, 0), [255, 255, 255, 255]);
+        assert_eq!(pixel(&loaded, 1, 0), [0, 0, 0, 255]);
+        assert_eq!(pixel(&loaded, 2, 0), [227, 177, 152, 255]);
+        assert_eq!(pixel(&loaded, 3, 0), [10, 20, 30, 255]);
+
+        // Premultiplied BGRA conversion for display.
+        assert_eq!(
+            rgba_to_premultiplied_bgra([10, 20, 30, 255]),
+            [30, 20, 10, 255]
+        );
+        assert_eq!(
+            rgba_to_premultiplied_bgra([200, 100, 50, 128]),
+            [25, 50, 100, 128]
+        );
+        assert_eq!(rgba_to_premultiplied_bgra([255, 255, 255, 0]), [0, 0, 0, 0]);
+        let img = ForensicsImage {
+            width: 2,
+            height: 1,
+            rgba: vec![200, 100, 50, 128, 1, 2, 3, 255],
+        };
+        assert_eq!(img.to_bgra8(), vec![25, 50, 100, 128, 3, 2, 1, 255]);
+
+        // The enhancer sees a transparent pixel as white paper, not as black ink.
+        let transparent = ForensicsImage {
+            width: 2,
+            height: 1,
+            rgba: vec![0, 0, 0, 0, 255, 255, 255, 255],
+        };
+        let eq = enhance_image(&transparent, EnhanceMode::GlobalEqualizeAndInvert).unwrap();
+        assert_eq!(eq.rgba[0], eq.rgba[4]);
+    }
+
+    /// Straightforward O(W*H*r^2) reference for the sliding-window local residual.
+    fn brute_force_local_window(
+        src: &ForensicsImage,
+        radius: usize,
+        gain: f64,
+        signal_unit: f64,
+        base_val: f64,
+        signal_fn: fn(i32, i32, i32) -> i32,
+    ) -> Vec<u8> {
+        let w = src.width as usize;
+        let h = src.height as usize;
+        let signal = |x: usize, y: usize| -> i32 {
+            let i = (y * w + x) * 4;
+            signal_fn(
+                i32::from(src.rgba[i]),
+                i32::from(src.rgba[i + 1]),
+                i32::from(src.rgba[i + 2]),
+            )
+        };
+        let mut out = vec![0xFF_u8; src.rgba.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let (x0, x1) = (x.saturating_sub(radius), (x + radius).min(w - 1));
+                let (y0, y1) = (y.saturating_sub(radius), (y + radius).min(h - 1));
+                let mut sum = 0_i64;
+                for yy in y0..=y1 {
+                    for xx in x0..=x1 {
+                        sum += i64::from(signal(xx, yy));
+                    }
+                }
+                let area = i64::try_from((x1 - x0 + 1) * (y1 - y0 + 1)).unwrap();
+                #[allow(clippy::cast_precision_loss)]
+                let local_mean = (sum as f64 * signal_unit) / (area as f64);
+                let val = f64::from(signal(x, y)) * signal_unit;
+                let diff = -(val - local_mean);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let mapped = diff.mul_add(gain, base_val).round().clamp(0.0, 255.0) as u8;
+                let i = (y * w + x) * 4;
+                out[i] = mapped;
+                out[i + 1] = mapped;
+                out[i + 2] = mapped;
+                out[i + 3] = 255;
+            }
+        }
+        out
+    }
+
+    fn noisy_image(w: u32, h: u32, seed: u32) -> ForensicsImage {
+        let mut state = seed;
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..w * h {
+            for _ in 0..3 {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                rgba.push(u8::try_from(state % 256).unwrap());
+            }
+            rgba.push(255);
+        }
+        ForensicsImage {
+            width: w,
+            height: h,
+            rgba,
+        }
+    }
+
+    #[test]
+    fn sliding_window_output_is_identical_to_a_brute_force_reference() {
+        // Sizes cover: larger than the window, narrower/shorter than the radius, single row,
+        // single column and a single pixel.
+        for (w, h, seed) in [
+            (61, 47, 0x1234_5678),
+            (40, 9, 0x0BAD_F00D),
+            (7, 53, 0x0C0F_FEE1),
+            (5, 4, 0x0000_BEEF),
+            (1, 30, 0x0000_0077),
+            (30, 1, 0x0000_0099),
+            (1, 1, 0x0000_0001),
+        ] {
+            let img = noisy_image(w, h, seed);
+            let chroma = enhance_image(&img, EnhanceMode::ChromaStegoExtract).unwrap();
+            let chroma_ref =
+                brute_force_local_window(&img, 18, 11.0, 0.25, 225.0, chroma_stego_signal);
+            assert_eq!(chroma.rgba, chroma_ref, "chroma {w}x{h}");
+
+            let adaptive = enhance_image(&img, EnhanceMode::AdaptiveBackgroundSubtract).unwrap();
+            let adaptive_ref = brute_force_local_window(
+                &img,
+                15,
+                9.0,
+                1.0 / 256.0,
+                128.0,
+                luminance_weighted_signal,
+            );
+            assert_eq!(adaptive.rgba, adaptive_ref, "adaptive {w}x{h}");
+        }
+    }
+}

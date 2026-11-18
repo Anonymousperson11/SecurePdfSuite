@@ -1,0 +1,15 @@
+[build]
+rustc-wrapper = "sccache"
+target = "x86_64-pc-windows-msvc"
+
+[env]
+SCCACHE_CACHE_SIZE = "20G"
+
+# Statically link the MSVC C runtime so the EXEs do not need the VC++ redistributable
+# (VCRUNTIME140.dll / api-ms-win-crt-*.dll) on a clean system.
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    # The static CRT libraries reference PDB files that are not shipped with the SDK.
+    "-C", "link-arg=/ignore:4099",
+]

@@ -1,0 +1,9 @@
+# Build output (includes target/dist installers and stage directories)
+/target/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
