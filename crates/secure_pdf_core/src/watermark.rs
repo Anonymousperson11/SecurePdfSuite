@@ -654,15 +654,42 @@ pub fn decode_microdots(image: &ForensicsImage) -> Option<MicrodotDecode> {
     if width == 0 || height == 0 || image.rgba.len() != width * height * 4 {
         return None;
     }
-    // Signed chroma signal: grey page content cancels out, the blue dots do not.
-    let chroma: Vec<f32> = image
+    // Primary pass: sample neutral/blue-tinted document pixels only, ignoring dark window chrome
+    // (`#121212`..`#262626`) and saturated red/amber UI banners (`B - R ≈ -150`) that appear in
+    // uncropped window or full-screen captures. Clamp individual pixels so colored artwork on a
+    // page cannot dominate a folded cell.
+    let page_samples: Vec<Option<f32>> = image
         .rgba
         .as_chunks::<4>()
         .0
         .iter()
-        .map(|px| f32::from(px[2]) - f32::from(px[0]))
+        .map(|px| {
+            let max_ch = px[0].max(px[1]).max(px[2]);
+            let rg_diff = px[1].abs_diff(px[0]);
+            (max_ch >= 64 && rg_diff <= 40)
+                .then(|| (f32::from(px[2]) - f32::from(px[0])).clamp(-4.0, 40.0))
+        })
         .collect();
+    if let Some(found) = search_microdot_scales(&page_samples, width, height) {
+        return Some(found);
+    }
 
+    // Fallback for pages with very dark backgrounds where `max_ch < 64`.
+    let clamped_all: Vec<Option<f32>> = image
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|px| Some((f32::from(px[2]) - f32::from(px[0])).clamp(-4.0, 40.0)))
+        .collect();
+    search_microdot_scales(&clamped_all, width, height)
+}
+
+fn search_microdot_scales(
+    samples: &[Option<f32>],
+    width: usize,
+    height: usize,
+) -> Option<MicrodotDecode> {
     let mut best: Option<MicrodotDecode> = None;
     for unit_px in 1..=MAX_MICRODOT_UNIT_PX {
         let tile_w = MICRODOT_TILE_W * unit_px;
@@ -670,7 +697,7 @@ pub fn decode_microdots(image: &ForensicsImage) -> Option<MicrodotDecode> {
         if width < tile_w || height < tile_h {
             break;
         }
-        let folded = FoldedTile::build(&chroma, width, height, tile_w, tile_h);
+        let folded = FoldedTile::build(samples, width, height, tile_w, tile_h);
         if let Some(found) = folded.decode(unit_px)
             && best.is_none_or(|b| found.signal > b.signal)
         {
@@ -691,15 +718,23 @@ struct FoldedTile {
 
 impl FoldedTile {
     #[allow(clippy::cast_precision_loss)]
-    fn build(chroma: &[f32], width: usize, height: usize, tile_w: usize, tile_h: usize) -> Self {
+    fn build(
+        samples: &[Option<f32>],
+        width: usize,
+        height: usize,
+        tile_w: usize,
+        tile_h: usize,
+    ) -> Self {
         let mut sum = vec![0.0_f64; tile_w * tile_h];
         let mut count = vec![0_u32; tile_w * tile_h];
-        for (y, row) in chroma.chunks_exact(width).enumerate().take(height) {
+        for (y, row) in samples.chunks_exact(width).enumerate().take(height) {
             let ty = y % tile_h;
-            for (x, &value) in row.iter().enumerate() {
-                let idx = ty * tile_w + x % tile_w;
-                sum[idx] += f64::from(value);
-                count[idx] += 1;
+            for (x, sample) in row.iter().enumerate() {
+                if let Some(value) = *sample {
+                    let idx = ty * tile_w + x % tile_w;
+                    sum[idx] += f64::from(value);
+                    count[idx] += 1;
+                }
             }
         }
         let mean: Vec<f64> = sum
@@ -1082,5 +1117,48 @@ mod tests {
             rgba: vec![255; 400],
         };
         assert_eq!(decode_microdots(&tiny), None);
+    }
+
+    #[test]
+    fn microdots_decode_from_full_window_capture_with_dark_chrome_and_colored_banners() {
+        let payload = encode_trace_payload("172.20.10.5", 1_794_980_554);
+        let page = capture_with_overlay(992, 773, payload, 2);
+
+        let (win_w, win_h) = (1_475_usize, 988_usize);
+        let mut window_rgba = vec![0_u8; win_w * win_h * 4];
+        for px in window_rgba.as_chunks_mut::<4>().0 {
+            *px = [18, 18, 18, 255];
+        }
+        // Bright red toolbar warning text (`B - R = -148`) and amber status banner (`B - R = -162`).
+        for y in 65..90 {
+            for x in 860..1_210 {
+                window_rgba[(y * win_w + x) * 4..(y * win_w + x + 1) * 4]
+                    .copy_from_slice(&[255, 107, 107, 255]);
+            }
+        }
+        for y in 948..972 {
+            for x in 290..720 {
+                window_rgba[(y * win_w + x) * 4..(y * win_w + x + 1) * 4]
+                    .copy_from_slice(&[247, 185, 85, 255]);
+            }
+        }
+        // Embed the rendered page in the centre of the dark viewport (`x=242..1234, y=151..924`).
+        let (ox, oy, pw, ph) = (242_usize, 151_usize, 992_usize, 773_usize);
+        for y in 0..ph {
+            let dst = ((oy + y) * win_w + ox) * 4;
+            let src = y * pw * 4;
+            window_rgba[dst..dst + pw * 4].copy_from_slice(&page.rgba[src..src + pw * 4]);
+        }
+
+        let capture = ForensicsImage {
+            width: u32::try_from(win_w).unwrap(),
+            height: u32::try_from(win_h).unwrap(),
+            rgba: window_rgba,
+        };
+        let found = decode_microdots(&capture).expect("full-window capture must decode");
+        assert_eq!(found.unit_px, 2);
+        assert_eq!(found.payload.ipv4, Ipv4Addr::new(172, 20, 10, 5));
+        assert_eq!(found.payload.unix_seconds, 1_794_980_554);
+        assert!(found.signal >= 9.0, "signal {}", found.signal);
     }
 }
