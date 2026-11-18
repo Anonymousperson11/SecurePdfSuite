@@ -229,8 +229,8 @@ fn handle_load_image(ui: &ForensicsUi) {
     }
     let owner = window_hwnd(&ui.win.window).ok();
     let filters = [(
-        "图片文件 (*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff)",
-        "*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff",
+        "图片文件 (*.png;*.jpg;*.jpeg;*.heic;*.heif;*.bmp;*.tif;*.tiff)",
+        "*.png;*.jpg;*.jpeg;*.heic;*.heif;*.bmp;*.tif;*.tiff",
     )];
     let paths = match pick_open_files(owner, "选择待取证分析的截图或照片", &filters, false)
     {

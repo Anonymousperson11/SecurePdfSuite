@@ -101,14 +101,84 @@ pub fn load_image_upright(path: &Path) -> CoreResult<ForensicsImage> {
     load_image_bytes_upright(&bytes)
 }
 
-/// Decodes raw encoded image bytes (`PNG`, `JPEG`, `BMP`, `TIFF`, `GIF`) into an upright,
-/// opaque [`ForensicsImage`] (see [`load_image_upright`]).
+/// Decodes raw encoded image bytes (`PNG`, `JPEG`, `HEIC`/`HEIF`, `BMP`, `TIFF`, `GIF`) into an
+/// upright, opaque [`ForensicsImage`] (see [`load_image_upright`]).
 ///
 /// # Errors
 ///
 /// Returns [`CoreError::Forensics`] if decoding fails or the image exceeds [`MAX_DECODE_PIXELS`].
 pub fn load_image_bytes_upright(bytes: &[u8]) -> CoreResult<ForensicsImage> {
     load_image_bytes_with_budget(bytes, MAX_FORENSICS_PIXELS)
+}
+
+/// Returns `true` when `bytes` starts with an ISO Base Media File Format `ftyp` box carrying a
+/// HEIF / HEIC brand (`heic`, `heix`, `hevc`, `hevx`, `heim`, `heis`, `hevm`, `hevs`, `mif1`, `msf1`).
+#[must_use]
+pub fn is_heif_container(bytes: &[u8]) -> bool {
+    const BRANDS: &[[u8; 4]] = &[
+        *b"heic", *b"heix", *b"hevc", *b"hevx", *b"heim", *b"heis", *b"hevm", *b"hevs", *b"mif1",
+        *b"msf1",
+    ];
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    let box_len = usize::try_from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .unwrap_or(0)
+        .min(bytes.len());
+    if box_len < 12 {
+        return false;
+    }
+    let is_brand = |four: &[u8; 4]| BRANDS.contains(four);
+    if <[u8; 4]>::try_from(&bytes[8..12]).is_ok_and(|four| is_brand(&four)) {
+        return true;
+    }
+    bytes
+        .get(16..box_len)
+        .is_some_and(|compat| compat.as_chunks::<4>().0.iter().any(is_brand))
+}
+
+fn load_heic_bytes_with_budget(bytes: &[u8], max_pixels: usize) -> CoreResult<ForensicsImage> {
+    let decode_ceiling = u64::try_from(MAX_DECODE_PIXELS).unwrap_or(u64::MAX);
+    let opts = heic_rs::DecodeOptions {
+        layout: heic_rs::PixelLayout::Rgba8,
+        max_pixels: Some(decode_ceiling),
+        apply_transforms: true,
+        decode_alpha: true,
+        ..heic_rs::DecodeOptions::default()
+    };
+
+    let decoded = heic_rs::decode(bytes, &opts).map_err(|err| match err {
+        heic_rs::Error::PixelLimit { .. } => {
+            CoreError::Forensics("HEIC 图片过大，超出可处理的 2.5 亿像素上限。".to_owned())
+        }
+        other => CoreError::Forensics(format!("HEIC/HEIF 图片解码失败：{other}")),
+    })?;
+
+    let (src_w, src_h) = (decoded.width, decoded.height);
+    let raw_img = RgbaImage::from_raw(src_w, src_h, decoded.data).ok_or_else(|| {
+        CoreError::Forensics("HEIC 解码后的像素缓冲区长度与尺寸不匹配。".to_owned())
+    })?;
+    let (tw, th) = fit_within_pixel_budget(src_w, src_h, max_pixels);
+    // ISO/IEC 23008-12 `clap`/`imir`/`irot` transforms are already applied by `heic_rs::decode`
+    // (applying legacy EXIF orientation on top would rotate iPhone photos a second time).
+    let sized = if (tw, th) == (src_w, src_h) {
+        raw_img
+    } else {
+        DynamicImage::ImageRgba8(raw_img)
+            .thumbnail_exact(tw, th)
+            .into_rgba8()
+    };
+    let (ow, oh) = sized.dimensions();
+    let mut rgba = sized.into_raw();
+    for px in rgba.as_chunks_mut::<4>().0 {
+        let flat = composite_on_white(*px);
+        *px = [flat[0], flat[1], flat[2], 255];
+    }
+    Ok(ForensicsImage {
+        width: ow,
+        height: oh,
+        rgba,
+    })
 }
 
 /// Target size for an image that must fit `max_pixels`, keeping the aspect ratio (v1.x rule:
@@ -141,6 +211,9 @@ fn fit_within_pixel_budget(width: u32, height: u32, max_pixels: usize) -> (u32, 
 }
 
 fn load_image_bytes_with_budget(bytes: &[u8], max_pixels: usize) -> CoreResult<ForensicsImage> {
+    if is_heif_container(bytes) {
+        return load_heic_bytes_with_budget(bytes, max_pixels);
+    }
     let orientation = parse_exif_orientation(bytes).unwrap_or(1);
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -226,13 +299,20 @@ pub fn enhance_image(src: &ForensicsImage, mode: EnhanceMode) -> CoreResult<Fore
         ));
     }
 
+    let chroma_r = adaptive_window_radius(18, src.width, src.height);
+    let adaptive_r = adaptive_window_radius(15, src.width, src.height);
     let out_rgba = match mode {
         EnhanceMode::ChromaStegoExtract => {
-            enhance_local_window(src, 18, 11.0, 0.25, 225.0, chroma_stego_signal)
+            enhance_local_window(src, chroma_r, 11.0, 0.25, 225.0, chroma_stego_signal)
         }
-        EnhanceMode::AdaptiveBackgroundSubtract => {
-            enhance_local_window(src, 15, 9.0, 1.0 / 256.0, 128.0, luminance_weighted_signal)
-        }
+        EnhanceMode::AdaptiveBackgroundSubtract => enhance_local_window(
+            src,
+            adaptive_r,
+            9.0,
+            1.0 / 256.0,
+            128.0,
+            luminance_weighted_signal,
+        ),
         EnhanceMode::GlobalEqualizeAndInvert => enhance_global_equalize_invert(src),
     };
 
@@ -268,6 +348,17 @@ const fn chroma_stego_signal(r: i32, g: i32, b: i32) -> i32 {
 #[inline]
 const fn luminance_weighted_signal(r: i32, g: i32, b: i32) -> i32 {
     r * 77 + g * 150 + b * 29
+}
+
+/// Scales the local background window proportionally on multi-megapixel camera captures so the
+/// window remains wider than glyph strokes, while keeping `base_radius` exact up to `1200` px.
+fn adaptive_window_radius(base_radius: usize, width: u32, height: u32) -> usize {
+    let longer = usize::try_from(width.max(height)).unwrap_or(base_radius);
+    if longer <= 1_200 {
+        base_radius
+    } else {
+        (base_radius.saturating_mul(longer) / 1_200).clamp(base_radius, 96)
+    }
 }
 
 /// O(W) memory, O(W*H) time 2D sliding-window background subtraction matching `WatermarkEnhancer`.
@@ -1034,6 +1125,88 @@ mod tests {
                 luminance_weighted_signal,
             );
             assert_eq!(adaptive.rgba, adaptive_ref, "adaptive {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn heif_container_detection_and_corrupt_heic_error_reporting() {
+        let mut fake_heic = Vec::new();
+        fake_heic.extend_from_slice(&24_u32.to_be_bytes());
+        fake_heic.extend_from_slice(b"ftypheic");
+        fake_heic.extend_from_slice(&0_u32.to_be_bytes());
+        fake_heic.extend_from_slice(b"mif1heix");
+        assert!(is_heif_container(&fake_heic));
+
+        let mut mif1_compat = Vec::new();
+        mif1_compat.extend_from_slice(&20_u32.to_be_bytes());
+        mif1_compat.extend_from_slice(b"ftypiso5");
+        mif1_compat.extend_from_slice(&0_u32.to_be_bytes());
+        mif1_compat.extend_from_slice(b"heic");
+        assert!(is_heif_container(&mif1_compat));
+
+        assert!(!is_heif_container(b"\x89PNG\r\n\x1a\n00000000"));
+        assert!(!is_heif_container(
+            b"\x00\x00\x00\x14ftypmp42\x00\x00\x00\x00mp42"
+        ));
+
+        let err = load_image_bytes_upright(&fake_heic).unwrap_err();
+        assert!(err.to_string().contains("HEIC"), "{err}");
+    }
+
+    #[test]
+    #[ignore = "diagnostic; decodes SECUREPDF_HEIC_IN and writes forensic PNGs to SECUREPDF_HEIC_OUT_DIR"]
+    fn extract_heic_forensics_to_dir() {
+        let input = std::path::PathBuf::from(std::env::var_os("SECUREPDF_HEIC_IN").unwrap());
+        let out_dir = std::path::PathBuf::from(std::env::var_os("SECUREPDF_HEIC_OUT_DIR").unwrap());
+        fs::create_dir_all(&out_dir).unwrap();
+
+        let loaded = load_image_upright(&input).unwrap();
+        println!("LOADED_UPRIGHT={}x{}", loaded.width, loaded.height);
+        if let Some(found) = crate::watermark::decode_microdots(&loaded) {
+            println!(
+                "MICRODOTS=OK ip={} unix={} local={}",
+                found.payload.ipv4,
+                found.payload.unix_seconds,
+                crate::localtime::format_unix_seconds_local(found.payload.unix_seconds)
+            );
+        } else {
+            println!("MICRODOTS=NONE (camera capture)");
+        }
+
+        // Save downscaled preview of upright original + full/preview of all 3 enhancement modes.
+        let save_scaled = |img: &ForensicsImage, name: &str, max_side: u32| {
+            let longer = img.width.max(img.height);
+            if longer <= max_side {
+                save_png(&out_dir.join(name), img).unwrap();
+            } else {
+                let scale = f64::from(max_side) / f64::from(longer);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let nw = ((f64::from(img.width) * scale).round() as u32).max(1);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let nh = ((f64::from(img.height) * scale).round() as u32).max(1);
+                let raw = RgbaImage::from_raw(img.width, img.height, img.rgba.clone()).unwrap();
+                let thumb = DynamicImage::ImageRgba8(raw)
+                    .thumbnail_exact(nw, nh)
+                    .into_rgba8();
+                thumb
+                    .write_to(
+                        &mut fs::File::create(out_dir.join(name)).unwrap(),
+                        ImageFormat::Png,
+                    )
+                    .unwrap();
+            }
+        };
+
+        save_scaled(&loaded, "0_upright_preview.png", 2000);
+        for (idx, mode, tag) in [
+            (1, EnhanceMode::ChromaStegoExtract, "chroma"),
+            (2, EnhanceMode::AdaptiveBackgroundSubtract, "adaptive"),
+            (3, EnhanceMode::GlobalEqualizeAndInvert, "equalize"),
+        ] {
+            let enh = enhance_image(&loaded, mode).unwrap();
+            save_png(&out_dir.join(format!("{idx}_{tag}_full.png")), &enh).unwrap();
+            save_scaled(&enh, &format!("{idx}_{tag}_preview.png"), 2000);
+            println!("SAVED {idx}_{tag} ({}x{})", enh.width, enh.height);
         }
     }
 }

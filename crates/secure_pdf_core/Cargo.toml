@@ -8,6 +8,7 @@ authors.workspace = true
 description = "Core cryptography, .spdf container, quota state machine, PDFium renderer, printing guard, and watermark forensics"
 
 [dependencies]
+heic-rs.workspace = true
 image.workspace = true
 windows-core.workspace = true
 windows-result.workspace = true

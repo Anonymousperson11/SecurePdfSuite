@@ -16,6 +16,7 @@ license = "MIT OR Apache-2.0"
 authors = ["SecurePdfSuite Contributors"]
 
 [workspace.dependencies]
+heic-rs = { version = "0.1", default-features = false, features = ["std"] }
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "bmp", "tiff", "gif"] }
 secure_pdf_core = { version = "2.0.0", path = "crates/secure_pdf_core" }
 tempfile = "3.24.0"
@@ -67,3 +68,6 @@ todo = "deny"
 undocumented_unsafe_blocks = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"
+
+[profile.dev.package.heic-rs]
+opt-level = 3

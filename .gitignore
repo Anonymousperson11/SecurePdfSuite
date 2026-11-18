@@ -1,6 +1,10 @@
 # Build output (includes target/dist installers and stage directories)
 /target/
 
+# Local installation directories if installed inside the workspace
+/SecurePdfCreator/
+/SecurePdfReader/
+
 # Editor / OS noise
 .vscode/
 .idea/

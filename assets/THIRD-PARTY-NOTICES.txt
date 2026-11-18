@@ -109,6 +109,8 @@ zeroize 与 windows-* 用于全部三个程序。
       https://github.com/image-rs/image-gif
   half 2.7.1    MIT OR Apache-2.0
       https://github.com/VoidStarKat/half-rs
+  heic-rs 0.1.4    MIT OR Apache-2.0
+      https://github.com/tbraun96/heic-rs
   image 0.25.10    MIT OR Apache-2.0
       https://github.com/image-rs/image
   miniz_oxide 0.8.9    MIT OR Zlib OR Apache-2.0
