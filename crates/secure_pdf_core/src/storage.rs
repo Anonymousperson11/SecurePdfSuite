@@ -901,7 +901,10 @@ mod tests {
     #[test]
     fn store_health_reports_fresh_consistent_and_inconsistent_without_writing() {
         let store = LocalQuotaStore::new(MemoryDualBackend::default(), WindowsDpapiProtector)
-            .with_mutex_prefix(format!("Local\\SecurePdfSuite.Test.Health.{}", std::process::id()));
+            .with_mutex_prefix(format!(
+                "Local\\SecurePdfSuite.Test.Health.{}",
+                std::process::id()
+            ));
         let policy = sample_policy(3, None);
         let hash = [0x42_u8; 32];
 

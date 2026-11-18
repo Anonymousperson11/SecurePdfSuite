@@ -1540,7 +1540,10 @@ mod tests {
         cand.status = 0x0000_0080;
         let verdict = eval(&cand);
         assert!(verdict.is_offline);
-        assert!(verdict.allowed, "offline only labels the printer, it does not block it");
+        assert!(
+            verdict.allowed,
+            "offline only labels the printer, it does not block it"
+        );
     }
 
     #[test]

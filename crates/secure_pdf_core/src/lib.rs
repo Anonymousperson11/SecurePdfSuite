@@ -49,6 +49,5 @@ pub use printing::{
 };
 pub use storage::{
     LocalQuotaStore, QuotaBackend, QuotaProtector, QuotaStatus, QuotaStoreHealth,
-    WindowsDpapiProtector,
-    WindowsDualQuotaBackend,
+    WindowsDpapiProtector, WindowsDualQuotaBackend,
 };
