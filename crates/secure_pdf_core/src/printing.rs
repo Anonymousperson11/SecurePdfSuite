@@ -12,6 +12,7 @@ use crate::format::SpdfPolicy;
 use crate::licensing::{enumerate_ipv4_addresses, netbios_computer_name};
 use crate::pdf::MemoryPdfDocument;
 use crate::storage::{LocalQuotaStore, QuotaBackend, QuotaProtector, QuotaStatus};
+use crate::watermark::{TextLayerStyle, paint_text_layer};
 use crate::win32_util::{HKeyGuard, to_wide_null, wide_ptr_to_string, wide_slice_to_string};
 
 /// Maximum physical print DPI permitted per axis.
@@ -145,27 +146,16 @@ pub struct PrintJobContext<'a> {
     pub machine_hash: &'a [u8; 32],
     /// Zero-based page indices to print, in output order (must be non-empty and in range).
     pub page_indices: &'a [i32],
-    /// Trace watermark burned onto every printed page regardless of policy flags
-    /// (see [`build_print_watermark_text`]); must not be blank.
+    /// Optional custom watermark configured by the sender (`policy.watermark_note`), rendered in
+    /// the bottom underlay at 80% transparency (20% opacity). Empty string prints no watermark.
     pub watermark_text: &'a str,
 }
 
-/// Builds the trace watermark burned onto printed pages: optional note, local time, IP and
-/// machine code (`"{note} | {time} | IP:{ip} | {code}"`, identical to v1.x).
+/// Resolves the custom watermark text for printed pages (`policy.watermark_note` trimmed; empty
+/// when the sender configured no custom watermark).
 #[must_use]
-pub fn build_print_watermark_text(
-    watermark_note: &str,
-    local_time: &str,
-    ipv4: &str,
-    machine_code: &str,
-) -> String {
-    let stamp = format!("{local_time} | IP:{ipv4} | {machine_code}");
-    let note = watermark_note.trim();
-    if note.is_empty() {
-        stamp
-    } else {
-        format!("{note} | {stamp}")
-    }
+pub fn build_print_watermark_text(watermark_note: &str) -> String {
+    watermark_note.trim().to_owned()
 }
 
 /// Parses a user page selection such as `1-3,5` into sorted, de-duplicated zero-based indices.
@@ -570,7 +560,7 @@ pub fn print_document_guarded<B: QuotaBackend, P: QuotaProtector, F: FnMut(i32, 
     }
 }
 
-/// Validates page selection and watermark before any quota is touched.
+/// Validates page selection before any quota is touched.
 fn validate_print_request(ctx: &PrintJobContext<'_>, page_count: i32) -> CoreResult<()> {
     if ctx.page_indices.is_empty() {
         return Err(CoreError::InvalidArgument(
@@ -583,11 +573,6 @@ fn validate_print_request(ctx: &PrintJobContext<'_>, page_count: i32) -> CoreRes
         .any(|&idx| idx < 0 || idx >= page_count)
     {
         return Err(CoreError::InvalidArgument("页码超出文档范围。".to_owned()));
-    }
-    if ctx.watermark_text.trim().is_empty() {
-        return Err(CoreError::InvalidArgument(
-            "打印追溯水印内容为空，已拒绝打印。".to_owned(),
-        ));
     }
     Ok(())
 }
@@ -629,19 +614,6 @@ impl Drop for PrinterDcGuard {
             // SAFETY: Releases Win32 printer DC owned by this guard.
             unsafe {
                 let _ = bindings::DeleteDC(self.0);
-            }
-        }
-    }
-}
-
-struct GdiObjectGuard(bindings::HGDIOBJ);
-
-impl Drop for GdiObjectGuard {
-    fn drop(&mut self) {
-        if !self.0.0.is_null() {
-            // SAFETY: Deletes GDI font object created for this print job.
-            unsafe {
-                let _ = bindings::DeleteObject(self.0);
             }
         }
     }
@@ -758,7 +730,12 @@ fn print_single_page(
     let (raster_w, raster_h, dest_x, dest_y, dest_w, dest_h) =
         compute_print_geometry(width_pt, height_pt, dev_w, dev_h, dpi_x, dpi_y);
 
-    let (bgr_bytes, _stride) = pdf.render_page_bgr24_for_print(page_index, raster_w, raster_h)?;
+    let fg_bgra = pdf.render_page_transparent_bgra_for_print(page_index, raster_w, raster_h)?;
+    #[allow(clippy::cast_possible_truncation)]
+    let raster_dpi =
+        ((f64::from(raster_h) * 72.0 / height_pt.max(1.0)).round() as i32).clamp(72, 300);
+    let (bgr_bytes, _stride) =
+        compose_print_page_bgr24(&fg_bgra, raster_w, raster_h, raster_dpi, watermark_text)?;
 
     // SAFETY: Begins a new physical printer page on active GDI DC.
     if unsafe { bindings::StartPage(dc) } <= 0 {
@@ -813,9 +790,6 @@ fn print_single_page(
         ));
     }
 
-    // The trace watermark is burned unconditionally: printed copies must always be attributable.
-    draw_gdi_rotated_watermark(dc, dev_w, dev_h, dpi_y, watermark_text);
-
     // SAFETY: Ends the current physical page and flushes strokes to the printer driver.
     if unsafe { bindings::EndPage(dc) } <= 0 {
         return Err(CoreError::PrinterSecurity(
@@ -823,6 +797,98 @@ fn print_single_page(
         ));
     }
     Ok(())
+}
+
+/// Composites a print page with an optional 80%-transparent custom underlay watermark.
+///
+/// Renders `custom_watermark` (`alpha = 51`) onto white paper first, composites the transparent
+/// PDF foreground strictly on top so text and images are never obscured, and packs 24-bpp `BGR`.
+///
+/// # Errors
+///
+/// Returns [`CoreError::InvalidArgument`] or font rendering errors when dimensions are invalid.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+pub fn compose_print_page_bgr24(
+    pdf_fg_bgra: &[u8],
+    width: i32,
+    height: i32,
+    raster_dpi: i32,
+    custom_watermark: &str,
+) -> CoreResult<(Vec<u8>, usize)> {
+    let w = usize::try_from(width)
+        .map_err(|_| CoreError::InvalidArgument("打印宽度非法。".to_owned()))?;
+    let h = usize::try_from(height)
+        .map_err(|_| CoreError::InvalidArgument("打印高度非法。".to_owned()))?;
+    if w == 0 || h == 0 || pdf_fg_bgra.len() != w * h * 4 {
+        return Err(CoreError::InvalidArgument(
+            "打印位图尺寸与缓冲区长度不匹配。".to_owned(),
+        ));
+    }
+
+    // 1. White paper underlay (`BGRA = [255, 255, 255, 255]`) with optional 80%-transparent custom watermark.
+    let mut paper_bgra = vec![0xFF_u8; w * h * 4];
+    let trimmed = custom_watermark.trim();
+    if !trimmed.is_empty() {
+        let dpi_f = (raster_dpi.clamp(72, 600)) as f32;
+        let font_px = ((dpi_f * 20.0 / 72.0).round() as i32).clamp(16, 220);
+        let style = TextLayerStyle {
+            font_px,
+            color_rgb: [0, 0, 0],
+            // 80% transparency = 20% opacity (`51 / 255 = 0.20`).
+            alpha: 51,
+            shadow_rgb: [255, 255, 255],
+            shadow_alpha: 0,
+            shadow_offset_px: 0.0,
+            min_step_x_px: dpi_f * 2.6,
+            gap_x_px: dpi_f * 1.1,
+            step_y_px: dpi_f * 1.65,
+            angle_deg: -30.0,
+        };
+        paint_text_layer(&mut paper_bgra, w, h, trimmed, &style)?;
+    }
+
+    // 2. Composite `pdf_fg_bgra` ON TOP OF `paper_bgra` (underlay mode).
+    // Standard PDFs leave blank paper at `alpha == 0`; full-page opaque scanned PDFs (`alpha == 255`
+    // everywhere) fall back to multiply-on-near-white so dark ink and photos stay 100% untouched.
+    let has_transparent_paper = pdf_fg_bgra.as_chunks::<4>().0.iter().any(|px| px[3] == 0);
+    let dib_stride = (w * 3 + 3) & !3;
+    let mut out_bgr = vec![0_u8; dib_stride * h];
+
+    for y in 0..h {
+        let fg_row = &pdf_fg_bgra[y * w * 4..(y + 1) * w * 4];
+        let bg_row = &paper_bgra[y * w * 4..(y + 1) * w * 4];
+        let dst_row = &mut out_bgr[y * dib_stride..y * dib_stride + w * 3];
+        for ((fg, bg), dst) in fg_row
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(bg_row.as_chunks::<4>().0)
+            .zip(dst_row.as_chunks_mut::<3>().0)
+        {
+            let a = u16::from(fg[3]);
+            if a == 0 {
+                *dst = [bg[0], bg[1], bg[2]];
+            } else if a == 255 {
+                if !has_transparent_paper && fg[0] >= 245 && fg[1] >= 245 && fg[2] >= 245 {
+                    let mul = |f: u8, b: u8| {
+                        u8::try_from((u16::from(f) * u16::from(b) + 127) / 255).unwrap_or(255)
+                    };
+                    *dst = [mul(fg[0], bg[0]), mul(fg[1], bg[1]), mul(fg[2], bg[2])];
+                } else {
+                    *dst = [fg[0], fg[1], fg[2]];
+                }
+            } else {
+                let inv = 255 - a;
+                let over = |f: u8, b: u8| {
+                    u8::try_from((u16::from(f) + (u16::from(b) * inv + 127) / 255).min(255))
+                        .unwrap_or(255)
+                };
+                *dst = [over(fg[0], bg[0]), over(fg[1], bg[1]), over(fg[2], bg[2])];
+            }
+        }
+    }
+
+    Ok((out_bgr, dib_stride))
 }
 
 fn compute_print_geometry(
@@ -857,112 +923,6 @@ fn compute_print_geometry(
     #[allow(clippy::cast_possible_truncation)]
     let raster_h = ((out_height_px * raster_scale).round() as i32).max(16);
     (raster_w, raster_h, dest_x, dest_y, dest_w, dest_h)
-}
-
-fn draw_gdi_rotated_watermark(dc: bindings::HDC, dev_w: i32, dev_h: i32, dpi_y: i32, text: &str) {
-    #[allow(clippy::cast_possible_truncation)]
-    let font_px = ((f64::from(dpi_y) * 14.0 / 72.0).round() as i32).clamp(14, 160);
-    let face = to_wide_null("Microsoft YaHei");
-    // SAFETY: Creates standard TrueType bold GDI font sized to physical printer DPI.
-    let font = unsafe {
-        bindings::CreateFontW(
-            -font_px,
-            0,
-            0,
-            0,
-            bindings::FW_BOLD,
-            0,
-            0,
-            0,
-            1, // DEFAULT_CHARSET
-            u32::try_from(bindings::OUT_TT_PRECIS).unwrap_or(0),
-            u32::try_from(bindings::CLIP_DEFAULT_PRECIS).unwrap_or(0),
-            u32::try_from(bindings::CLEARTYPE_QUALITY).unwrap_or(0),
-            u32::try_from(bindings::DEFAULT_PITCH).unwrap_or(0),
-            PCWSTR(face.as_ptr()),
-        )
-    };
-    if font.0.is_null() {
-        return;
-    }
-    let _font_guard = GdiObjectGuard(bindings::HGDIOBJ(font.0));
-    // SAFETY: Selects watermark font into `dc` and preserves previous font to restore cleanly.
-    let prev_obj = unsafe { bindings::SelectObject(dc, bindings::HGDIOBJ(font.0)) };
-
-    // SAFETY: Enables advanced GDI world transform for smooth -30 degree watermark stamping.
-    unsafe {
-        let _ = bindings::SetGraphicsMode(dc, bindings::GM_ADVANCED);
-    }
-    // SAFETY: Draws watermark glyphs with transparent background fill.
-    unsafe {
-        let _ = bindings::SetBkMode(dc, bindings::TRANSPARENT);
-    }
-    // SAFETY: Subtle cool-gray trace color (`RGB(150, 158, 170)` -> COLORREF `0x00AA9E96`).
-    unsafe {
-        let _ = bindings::SetTextColor(dc, bindings::COLORREF(0x00AA_9E96));
-    }
-    // SAFETY: Centers drawn string horizontally around transform origin.
-    unsafe {
-        let _ = bindings::SetTextAlign(
-            dc,
-            u32::try_from(bindings::TA_CENTER | bindings::TA_BASELINE).unwrap_or(0),
-        );
-    }
-
-    let utf16: Vec<u16> = text.encode_utf16().collect();
-    #[allow(clippy::cast_precision_loss)]
-    let est_w = (utf16.len() as f32) * (font_px as f32) * 0.65;
-    #[allow(clippy::cast_precision_loss)]
-    let est_h = font_px as f32;
-    #[allow(clippy::cast_possible_truncation)]
-    let step_x = ((est_w * 1.35).max(220.0) as i32).max(220);
-    #[allow(clippy::cast_possible_truncation)]
-    let step_y = ((est_h * 3.8).max(160.0) as i32).max(160);
-
-    let angle_rad = (-30.0_f32).to_radians();
-    let cos_a = angle_rad.cos();
-    let sin_a = angle_rad.sin();
-
-    let mut y = -dev_h / 2;
-    while y < dev_h * 3 / 2 {
-        let mut x = -dev_w / 2;
-        while x < dev_w * 3 / 2 {
-            #[allow(clippy::cast_precision_loss)]
-            let xf = bindings::XFORM {
-                eM11: cos_a,
-                eM12: sin_a,
-                eM21: -sin_a,
-                eM22: cos_a,
-                eDx: x as f32,
-                eDy: y as f32,
-            };
-            // SAFETY: Applies translation + rotation world transform for current grid cell.
-            unsafe {
-                let _ = bindings::SetWorldTransform(dc, &raw const xf);
-            }
-            // SAFETY: Renders watermark text slice at transformed `(0, 0)` origin.
-            unsafe {
-                let _ = bindings::TextOutW(dc, 0, 0, &utf16);
-            }
-            x += step_x;
-        }
-        y += step_y;
-    }
-
-    // SAFETY: Restores identity transform and previous GDI font before returning.
-    unsafe {
-        let _ = bindings::ModifyWorldTransform(
-            dc,
-            None,
-            u32::try_from(bindings::MWT_IDENTITY).unwrap_or(1),
-        );
-    }
-    if !prev_obj.0.is_null() {
-        // SAFETY: Restores original GDI font handle into `dc`.
-        unsafe {
-            let _ = bindings::SelectObject(dc, prev_obj);
-        }
-    }
 }
 
 fn get_default_printer_name() -> Option<String> {
@@ -1480,24 +1440,59 @@ mod tests {
     }
 
     #[test]
-    fn print_watermark_text_always_carries_time_ip_and_machine_code() {
-        let with_note = build_print_watermark_text(
-            " 张三专用 ",
-            "2026-11-16 09:30:00",
-            "192.168.1.20",
-            "ABCD-EFGH-JKLM",
-        );
-        assert_eq!(
-            with_note,
-            "张三专用 | 2026-11-16 09:30:00 | IP:192.168.1.20 | ABCD-EFGH-JKLM"
-        );
-        let bare =
-            build_print_watermark_text("  ", "2026-11-16 09:30:00", "10.0.0.8", "WXYZ-2345-6789");
-        assert_eq!(bare, "2026-11-16 09:30:00 | IP:10.0.0.8 | WXYZ-2345-6789");
+    fn print_watermark_text_uses_only_trimmed_custom_note() {
+        assert_eq!(build_print_watermark_text(" 张三专用 "), "张三专用");
+        assert_eq!(build_print_watermark_text("   "), "");
     }
 
     #[test]
-    fn print_request_validation_rejects_bad_pages_and_blank_watermark_before_quota() {
+    fn underlay_custom_watermark_stays_beneath_foreground_ink_and_images_at_80_percent_transparency()
+     {
+        let (w, h) = (600_i32, 400_i32);
+        let wu = usize::try_from(w).unwrap();
+        let hu = usize::try_from(h).unwrap();
+        // Transparent blank paper (`[0,0,0,0]`) with an opaque dark photo (`[50,45,40,255]`) in the middle.
+        let mut fg = vec![0_u8; wu * hu * 4];
+        for y in 120..280 {
+            for x in 150..450 {
+                let idx = (y * wu + x) * 4;
+                fg[idx..idx + 4].copy_from_slice(&[50, 45, 40, 255]);
+            }
+        }
+        let (bgr, stride) = compose_print_page_bgr24(&fg, w, h, 150, "内部受控资料").unwrap();
+
+        // 1. Inside the opaque photo, every pixel must equal `[50, 45, 40]` untouched (underlay never bleeds on top!).
+        for y in 120..280 {
+            for x in 150..450 {
+                let off = y * stride + x * 3;
+                assert_eq!(&bgr[off..off + 3], &[50, 45, 40], "bleed at ({x},{y})");
+            }
+        }
+        // 2. Outside the photo, blank paper has 80%-transparent watermark (`RGB(204,204,204)` at full coverage).
+        let mut min_paper = 255_u8;
+        let mut marked = 0_usize;
+        for y in 0..110 {
+            for x in 0..wu {
+                let b = bgr[y * stride + x * 3];
+                min_paper = min_paper.min(b);
+                if b < 250 {
+                    marked += 1;
+                }
+            }
+        }
+        assert!(
+            (202..=206).contains(&min_paper),
+            "expected ~204 (80% transparent), got {min_paper}"
+        );
+        assert!(marked > 500, "watermark missing on blank paper ({marked})");
+
+        // 3. Empty custom watermark leaves blank paper pure white `(255,255,255)`.
+        let (clean, _) = compose_print_page_bgr24(&fg, w, h, 150, "   ").unwrap();
+        assert_eq!(&clean[0..3], &[255, 255, 255]);
+    }
+
+    #[test]
+    fn print_request_validation_rejects_bad_pages_and_allows_empty_custom_watermark() {
         let policy = SpdfPolicy {
             doc_id: crate::format::DocId::from_wire_bytes([7; 16]),
             max_prints: 1,
@@ -1516,10 +1511,10 @@ mod tests {
             watermark_text: text,
         };
         assert!(validate_print_request(&ctx(&[0, 2], "t"), 3).is_ok());
+        assert!(validate_print_request(&ctx(&[0], ""), 3).is_ok());
         assert!(validate_print_request(&ctx(&[], "t"), 3).is_err());
         assert!(validate_print_request(&ctx(&[3], "t"), 3).is_err());
         assert!(validate_print_request(&ctx(&[-1], "t"), 3).is_err());
-        assert!(validate_print_request(&ctx(&[0], "   "), 3).is_err());
     }
 
     #[test]

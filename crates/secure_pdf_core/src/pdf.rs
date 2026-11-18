@@ -19,6 +19,7 @@ const FPDF_ANNOT: c_int = 0x01;
 const FPDF_PRINTING: c_int = 0x0800;
 const FPDF_BITMAP_BGR: c_int = 2;
 const FPDF_BITMAP_BGRX: c_int = 3;
+const FPDF_BITMAP_BGRA: c_int = 4;
 
 #[repr(C)]
 struct FpdfLibraryConfig {
@@ -344,6 +345,27 @@ impl MemoryPdfDocument {
         self.render_page_internal(page_index, width, height, FPDF_BITMAP_BGRX, FPDF_ANNOT)
     }
 
+    /// Renders `page_index` onto a transparent premultiplied `BGRA8` canvas for print compositing
+    /// over an underlay watermark (`blank paper = alpha 0`, `ink/images = opaque`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Pdfium`] if dimensions exceed [`MAX_RENDER_PIXELS`] or `PDFium` fails.
+    pub fn render_page_transparent_bgra_for_print(
+        &self,
+        page_index: i32,
+        width: i32,
+        height: i32,
+    ) -> CoreResult<Vec<u8>> {
+        self.render_page_internal(
+            page_index,
+            width,
+            height,
+            FPDF_BITMAP_BGRA,
+            FPDF_ANNOT | FPDF_PRINTING,
+        )
+    }
+
     /// Renders `page_index` for GDI physical printing in DWORD-aligned 24-bpp `BGR` layout.
     ///
     /// Returns `(pixels, row_stride_bytes)`.
@@ -447,9 +469,14 @@ impl MemoryPdfDocument {
             destroy: api.bitmap_destroy,
         };
 
-        // SAFETY: Fills bitmap background solid opaque white before rendering PDF page strokes.
+        let fill_color = if format == FPDF_BITMAP_BGRA {
+            0x0000_0000
+        } else {
+            0xFFFF_FFFF
+        };
+        // SAFETY: Clears bitmap to transparent (BGRA underlay mode) or opaque white before rendering.
         unsafe {
-            let _ = (api.bitmap_fill_rect)(bmp_guard.bmp, 0, 0, width, height, 0xFFFF_FFFF);
+            let _ = (api.bitmap_fill_rect)(bmp_guard.bmp, 0, 0, width, height, fill_color);
         }
         // SAFETY: Renders `page_guard.page` into `bmp_guard.bmp` cleanly under `PDFIUM_GATE`.
         unsafe {

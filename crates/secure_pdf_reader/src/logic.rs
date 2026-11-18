@@ -1153,12 +1153,12 @@ mod tests {
         assert_eq!(found.payload.ipv4, Ipv4Addr::new(192, 168, 31, 207));
         assert_eq!(found.payload.unix_seconds, TRACE_UNIX);
 
-        // On a white page the hidden layer stays near-imperceptible: even where a glyph crosses a
-        // microdot the red channel drops by less than 8 %.
+        // On a white page the hidden layer stays airy and unobtrusive: even where a glyph crosses
+        // a microdot the red channel drops by less than 9 %.
         let white = vec![255_u8; dims(w, h).0 * dims(w, h).1 * 4];
         let shown = composite_overlay_over_page(&white, &overlay);
         let darkest = shown.as_chunks::<4>().0.iter().map(|p| p[0]).min().unwrap();
-        assert!(darkest >= 235, "hidden layer too visible: {darkest}");
+        assert!(darkest >= 230, "hidden layer too visible: {darkest}");
     }
 
     #[test]

@@ -390,7 +390,7 @@ fn signal_percentiles(values: &[f32], weights: &[f32]) -> (f32, f32, f32) {
     let mut hist = vec![0_u64; BINS];
     let mut total = 0_u64;
     for (&v, &w) in values.iter().zip(weights) {
-        if w > 0.90 {
+        if w > 0.85 {
             let bin = ((v - MIN_V) * SCALE).round().clamp(0.0, (BINS - 1) as f32) as usize;
             hist[bin] += 1;
             total += 1;
@@ -445,9 +445,37 @@ fn enhance_chroma_watermark(src: &ForensicsImage) -> Vec<u8> {
         chroma_norm.push((3.0 * (b - r) + (b - g)) * (220.0 / denom) * 0.25);
     }
 
-    let r_inner = (longer / 950).min(6);
-    let r_halo = (longer / 250).clamp(3, 20);
-    let r_outer = (longer / 95).clamp(18, 56);
+    // Auto-detect high-frequency LCD camera moire energy on non-ink paper pixels so both 1080p/
+    // 1440p WeChat photos and 4032p raw HEIC photos smooth subpixel colour fringes without
+    // blurring clean 1:1 screenshots or small test images.
+    let mut hf_sum = 0.0_f64;
+    let mut hf_cnt = 0_u64;
+    for y in (0..h).step_by(4) {
+        let row = y * w;
+        for x in 0..w.saturating_sub(4) {
+            if (luma[row + x] - luma[row + x + 3]).abs() < 28.0 && luma[row + x] > 100.0 {
+                let c0 = chroma_norm[row + x];
+                hf_sum += f64::from(
+                    (c0 - chroma_norm[row + x + 2]).abs() + (c0 - chroma_norm[row + x + 3]).abs(),
+                );
+                hf_cnt += 1;
+            }
+        }
+    }
+    let hf_moire = if hf_cnt > 0 {
+        (hf_sum / (hf_cnt as f64)) as f32
+    } else {
+        0.0
+    };
+    let r_inner = if longer < 256 {
+        0
+    } else if hf_moire > 2.2 {
+        (longer / 780).clamp(3, 5)
+    } else {
+        (longer / 1_200).min(2)
+    };
+    let r_halo = (longer / 240).clamp(6, 18);
+    let r_outer = (longer / 92).clamp(18, 52);
 
     let luma_fine = blur_box_passes(&luma, w, h, r_inner, 3);
     let luma_paper = blur_box_passes(&luma_fine, w, h, r_outer, 3);
@@ -472,11 +500,13 @@ fn enhance_chroma_watermark(src: &ForensicsImage) -> Vec<u8> {
 
     let mut chroma_clean = vec![0.0_f32; n];
     let mut luma_clean = vec![0.0_f32; n];
-    let mut wl_vec = vec![0.0_f32; n];
+    let mut chroma_weights = vec![0.0_f32; n];
+    let mut luma_weights = vec![0.0_f32; n];
     for i in 0..n {
         let wc = (1.0 - 4.0 * ink_tight[i]).clamp(0.0, 1.0);
         let wl = (1.0 - 12.0 * ink_wide[i]).clamp(0.0, 1.0);
-        wl_vec[i] = wl;
+        chroma_weights[i] = wc;
+        luma_weights[i] = wl;
         chroma_clean[i] = chroma_fine[i] * wc + chroma_rough_bg[i] * (1.0 - wc);
         luma_clean[i] = luma_fine[i] * wl + luma_paper[i] * (1.0 - wl);
     }
@@ -485,29 +515,30 @@ fn enhance_chroma_watermark(src: &ForensicsImage) -> Vec<u8> {
 
     let mut sig = vec![0.0_f32; n];
     for i in 0..n {
-        let wc = (1.0 - 4.0 * ink_tight[i]).clamp(0.0, 1.0);
-        let wl = wl_vec[i];
+        let wc = chroma_weights[i];
+        let wl = luma_weights[i];
         let c_band = (chroma_clean[i] - chroma_bg[i]) * wc;
         let paper_y = luma_bg[i].max(48.0);
         let l_drop = ((luma_bg[i] - luma_clean[i]) * (220.0 / paper_y)).max(0.0) * wl;
-        sig[i] = c_band + 0.50 * l_drop;
+        sig[i] = c_band + 0.55 * l_drop;
     }
 
-    let (p50, p84, p988) = signal_percentiles(&sig, &wl_vec);
-    let floor = (p50 + 0.65 * (p84 - p50)).max(p50 + 1.0);
-    let ceil = (p50 + 0.90 * (p988 - p50)).max(floor + 4.0);
-    let span = (ceil - floor).max(4.0);
+    let (p50, p84, p988) = signal_percentiles(&sig, &chroma_weights);
+    let sigma = (p84 - p50).max(0.22);
+    let floor = p50 + 0.85 * sigma;
+    let ceil = (p50 + 0.88 * (p988 - p50)).max(floor + (2.8 * sigma).max(1.2));
+    let span = (ceil - floor).max(1.2);
 
     let mut out = vec![0xFF_u8; n * 4];
     for i in 0..n {
         let t = ((sig[i] - floor) / span).clamp(0.0, 1.0);
-        let s_curve = t * t * (3.0 - 2.0 * t);
+        let dark_curve = t * (2.0 - t);
         let context_ink = if luma_paper[i] >= 95.0 {
             raw_ink[i] * 26.0
         } else {
             16.0
         };
-        let mapped = (252.0 - (s_curve * 236.0).max(context_ink))
+        let mapped = (252.0 - (dark_curve * 236.0).max(context_ink))
             .round()
             .clamp(0.0, 255.0) as u8;
         let dst = i * 4;
@@ -538,7 +569,11 @@ fn enhance_adaptive_background(src: &ForensicsImage) -> Vec<u8> {
         luma.push((f32::from(r) * 77.0 + f32::from(g) * 150.0 + f32::from(b) * 29.0) / 256.0);
     }
 
-    let r_inner = (longer / 950).min(6);
+    let r_inner = if longer < 256 {
+        0
+    } else {
+        (longer / 780).clamp(2, 5)
+    };
     let r_outer = (longer / 95).clamp(15, 56);
     let fine = blur_box_passes(&luma, w, h, r_inner, 3);
     let paper = blur_box_passes(&fine, w, h, r_outer, 3);
@@ -1243,6 +1278,79 @@ mod tests {
         assert!(
             body_ink >= 200,
             "black PDF body ink should stay faintly suppressed, got {body_ink}"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::many_single_char_names,
+        clippy::suboptimal_flops
+    )]
+    fn wechat_compressed_camera_photo_with_hidden_only_watermark_is_extracted_clearly() {
+        // Simulates a 1440x1080 WeChat-compressed phone photo of a screen with ONLY the hidden
+        // trace watermark enabled (`[0, 95, 250]`, alpha=15): strong +/-13 period-6 RGB LCD moire,
+        // 22 % corner vignetting, dense black text lines, and a heavily ISP-attenuated hidden
+        // watermark stroke (`dR = -4.5, dG = -3.0, dB = -0.5` after 70 % ISP chroma loss).
+        let (w, h) = (1_440_u32, 1_080_u32);
+        let mut rgba = vec![255_u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let xf = x as f32;
+                let yf = y as f32;
+                let vig =
+                    1.0 - 0.22 * (((xf - 720.0) / 720.0).powi(2) + ((yf - 540.0) / 540.0).powi(2));
+                let (mr, mg, mb) = match (x + y / 7) % 6 {
+                    0 | 1 => (13.0, -5.0, -8.0),
+                    2 | 3 => (-6.0, 11.0, -5.0),
+                    _ => (-7.0, -6.0, 13.0),
+                };
+                let mut r = 212.0 * vig + mr;
+                let mut g = 218.0 * vig + mg;
+                let mut b = 234.0 * vig + mb;
+
+                if (460..=477).contains(&y) && (120..=1_320).contains(&x) && (x % 24 < 16) {
+                    r *= 0.22;
+                    g *= 0.22;
+                    b *= 0.22;
+                } else if (230..=243).contains(&y) && (220..=1_180).contains(&x) {
+                    r -= 4.5 * vig;
+                    g -= 3.0 * vig;
+                    b -= 0.5 * vig;
+                }
+                let idx = ((y * w + x) * 4) as usize;
+                rgba[idx] = r.round().clamp(0.0, 255.0) as u8;
+                rgba[idx + 1] = g.round().clamp(0.0, 255.0) as u8;
+                rgba[idx + 2] = b.round().clamp(0.0, 255.0) as u8;
+                rgba[idx + 3] = 255;
+            }
+        }
+        // Encode and decode through lossy JPEG (quality 78, typical WeChat photo compression) to
+        // verify extraction survives 4:2:0 DCT chroma quantization as well.
+        let rgb_img = image::RgbImage::from_fn(w, h, |x, y| {
+            let idx = ((y * w + x) * 4) as usize;
+            image::Rgb([rgba[idx], rgba[idx + 1], rgba[idx + 2]])
+        });
+        let mut jpeg_bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, 78)
+            .encode_image(&rgb_img)
+            .unwrap();
+        let loaded = load_image_bytes_upright(&jpeg_bytes).unwrap();
+        let enh = enhance_image(&loaded, EnhanceMode::ChromaStegoExtract).unwrap();
+
+        let paper = pixel(&enh, 720, 120)[0];
+        let wm = pixel(&enh, 720, 236)[0];
+        let body_ink = pixel(&enh, 720, 468)[0];
+        assert!(paper >= 240, "paper should stay white, got {paper}");
+        assert!(
+            wm <= 95,
+            "hidden-only watermark should extract clearly after JPEG-78 + LCD moire, got {wm}"
+        );
+        assert!(
+            body_ink >= 200,
+            "body text stays suppressed, got {body_ink}"
         );
     }
 

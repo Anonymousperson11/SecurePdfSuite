@@ -169,7 +169,10 @@ fn create_widgets(
         chk_hidden_wm: check_box("启用隐形溯源水印（时间、IP、设备码）", true)?,
         chk_blur_unfocus: check_box("阅读窗口失去焦点时自动遮挡内容", true)?,
         chk_adjust_moire: check_box("允许接收方调节摩尔纹强度", false)?,
-        wm_note_box: text_box("可选，例如：张三专用", false)?,
+        wm_note_box: text_box(
+            "可选，例如：内部资料 严禁外传（打印时 80% 透明度置于底层）",
+            false,
+        )?,
         out_dir_box,
         start_btn,
         results_list,
@@ -531,7 +534,7 @@ fn build_right_column(ui: &EncryptUi) -> windows_core::Result<Border> {
     col.Children()?.Append(&ui.chk_adjust_moire)?;
 
     col.Children()?.Append(&labeled(
-        "水印附带的发送方备注（可选）",
+        "自定义水印文字（可选，用于打印底层水印及页面备注）",
         &ui.wm_note_box.cast()?,
     )?)?;
 

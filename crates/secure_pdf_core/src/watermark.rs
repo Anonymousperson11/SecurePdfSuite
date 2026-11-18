@@ -75,22 +75,23 @@ impl TextLayerStyle {
         }
     }
 
-    /// Hidden trace watermark: near-isoluminant cyan-blue `ARGB(10, 0, 232, 255)` with no shadow;
-    /// keeps green/blue at paper level (`ΔY ≈ 1.4%`, imperceptible to normal reading) while
-    /// preserving a clean `(B - R)` chroma signature for camera and screenshot forensics.
+    /// Hidden trace watermark: subtle sky-blue `ARGB(15, 0, 95, 250)` at 24 DIP bold with no
+    /// shadow; remains clean and airy on white paper (`R=240, G=246, B=255`) when the visible
+    /// watermark is off, while carrying wide strokes plus combined `(B - R)` chroma and gentle
+    /// luminance modulation that survive smartphone ISP chroma denoising and `WeChat` compression.
     #[must_use]
     pub fn hidden(dpi_scale: f64) -> Self {
         let s = scale_factor(dpi_scale);
         Self {
-            font_px: scaled_px(18.0, s),
-            color_rgb: [0, 232, 255],
-            alpha: 10,
+            font_px: scaled_px(24.0, s),
+            color_rgb: [0, 95, 250],
+            alpha: 15,
             shadow_rgb: [255, 255, 255],
             shadow_alpha: 0,
             shadow_offset_px: 0.0,
-            min_step_x_px: 330.0 * s,
-            gap_x_px: 90.0 * s,
-            step_y_px: 132.0 * s,
+            min_step_x_px: 360.0 * s,
+            gap_x_px: 115.0 * s,
+            step_y_px: 168.0 * s,
             angle_deg: -26.0,
         }
     }
@@ -951,7 +952,7 @@ mod tests {
         // Subtle slate at alpha 18, legible without obscuring document text.
         assert_eq!((v1.color_rgb, v1.alpha), ([30, 41, 59], 18));
         let hidden = TextLayerStyle::hidden(1.5);
-        assert_eq!(hidden.font_px, 27);
+        assert_eq!(hidden.font_px, 36);
         assert!(hidden.color_rgb[2] > hidden.color_rgb[0] + 200);
     }
 
@@ -1012,6 +1013,100 @@ mod tests {
             assert!(hits > 60, "quadrant ({qx},{qy}) has {hits} marked pixels");
         }
         assert!(paint_text_layer(&mut overlay[..8], w, h, "x", &style).is_err());
+    }
+
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::suboptimal_flops
+    )]
+    fn hidden_only_text_watermark_survives_camera_moire_and_jpeg_into_legible_forensics() {
+        use crate::forensics::{EnhanceMode, enhance_image, load_image_bytes_upright};
+
+        let (w, h) = (960_usize, 640_usize);
+        let mut overlay = vec![0_u8; w * h * 4];
+        // Hidden watermark ONLY (visible watermark OFF), at 150 % DPI scale.
+        paint_text_layer(
+            &mut overlay,
+            w,
+            h,
+            "IP:172.20.10.5 | 26-11-18 02:30:00 | YVN8-2N88-7RN5",
+            &TextLayerStyle::hidden(1.5),
+        )
+        .unwrap();
+
+        // White page with dark textbook lines, composited with hidden-only overlay.
+        let mut page = vec![255_u8; w * h * 4];
+        for y in 0..h {
+            if (y % 54) < 16 {
+                for x in 90..(w - 90) {
+                    if (x / 18 + y / 54) % 3 != 0 {
+                        let idx = (y * w + x) * 4;
+                        page[idx..idx + 4].copy_from_slice(&[38, 38, 38, 255]);
+                    }
+                }
+            }
+        }
+        let screen = composite_overlay_over_page(&page, &overlay);
+
+        // Simulate smartphone capture: 55 % ISP chroma wipeout toward luma + cool-LCD WB +
+        // +/-11 period-6 RGB subpixel moire + JPEG quality-78 4:2:0 compression.
+        let rgb_photo = image::RgbImage::from_fn(
+            u32::try_from(w).unwrap(),
+            u32::try_from(h).unwrap(),
+            |x, y| {
+                let idx = (y as usize * w + x as usize) * 4;
+                let sr = f32::from(screen[idx]);
+                let sg = f32::from(screen[idx + 1]);
+                let sb = f32::from(screen[idx + 2]);
+                let sy = 0.299 * sr + 0.587 * sg + 0.114 * sb;
+                let cr = sy + 0.45 * (sr - sy);
+                let cg = sy + 0.45 * (sg - sy);
+                let cb = sy + 0.45 * (sb - sy);
+                let (mr, mg, mb) = match (x + y / 7) % 6 {
+                    0 | 1 => (11.0, -4.0, -7.0),
+                    2 | 3 => (-5.0, 9.0, -4.0),
+                    _ => (-6.0, -5.0, 11.0),
+                };
+                image::Rgb([
+                    (cr * 0.84 + mr).round().clamp(0.0, 255.0) as u8,
+                    (cg * 0.86 + mg).round().clamp(0.0, 255.0) as u8,
+                    (cb * 0.92 + mb).round().clamp(0.0, 255.0) as u8,
+                ])
+            },
+        );
+        let mut jpeg_bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, 78)
+            .encode_image(&rgb_photo)
+            .unwrap();
+        let photo = load_image_bytes_upright(&jpeg_bytes).unwrap();
+        let enh = enhance_image(&photo, EnhanceMode::ChromaStegoExtract).unwrap();
+
+        // Count strongly extracted charcoal watermark glyph pixels (`<= 95`) on non-ink paper,
+        // while verifying blank paper stays bright white (`median >= 244`).
+        let mut paper_samples = Vec::new();
+        let mut dark_wm_pixels = 0_usize;
+        for (i, ov) in overlay.as_chunks::<4>().0.iter().enumerate() {
+            let out_g = enh.rgba[i * 4];
+            let is_page_white = page[i * 4] > 240;
+            if is_page_white && ov[3] == 0 {
+                paper_samples.push(out_g);
+            } else if is_page_white && ov[3] >= 12 && out_g <= 95 {
+                dark_wm_pixels += 1;
+            }
+        }
+        paper_samples.sort_unstable();
+        let median_paper = paper_samples[paper_samples.len() / 2];
+        assert!(
+            median_paper >= 244,
+            "blank paper should stay clean white, median={median_paper}"
+        );
+        assert!(
+            dark_wm_pixels >= 1_500,
+            "hidden-only glyph strokes must extract strongly, got only {dark_wm_pixels} dark pixels"
+        );
     }
 
     #[test]

@@ -154,15 +154,11 @@ impl ReaderSession {
         )
     }
 
-    /// Trace label burned onto every printed page: note, the given local time, IP, machine code.
+    /// Custom watermark text rendered in the bottom underlay of printed pages (80% transparent);
+    /// empty when the sender configured no custom watermark.
     #[must_use]
-    pub fn print_watermark_text(&self, local_time: &str) -> String {
-        build_print_watermark_text(
-            &self.policy.watermark_note,
-            local_time,
-            &self.current_ip(),
-            &self.device.machine_code,
-        )
+    pub fn print_watermark_text(&self) -> String {
+        build_print_watermark_text(&self.policy.watermark_note)
     }
 }
 
@@ -300,11 +296,10 @@ mod tests {
             s.screen_watermark_text("26-11-16 18:31:00"),
             "张三专用 | IP:10.0.0.8 | 26-11-16 18:31:00 | YVN8-2N88-7RN5"
         );
-        // Printed pages carry the full date and time first, then IP and machine code.
-        assert_eq!(
-            s.print_watermark_text("2026-11-16 18:31:00"),
-            "张三专用 | 2026-11-16 18:31:00 | IP:10.0.0.8 | YVN8-2N88-7RN5"
-        );
+        // Printed pages carry only the custom watermark note (or empty when none was set).
+        assert_eq!(s.print_watermark_text(), "张三专用");
+        let bare = session(SecurityFlags::HIDDEN_WATERMARK, "   ", 2);
+        assert_eq!(bare.print_watermark_text(), "");
     }
 
     #[test]

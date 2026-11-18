@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use secure_pdf_core::localtime::{LocalDateTime, format_dotnet_ticks_local};
+use secure_pdf_core::localtime::format_dotnet_ticks_local;
 use secure_pdf_core::printing::{
     PrintJobContext, PrinterPolicyEvaluation, list_evaluated_printers, print_document_guarded,
 };
@@ -349,12 +349,12 @@ fn populate_dialog_body(
         true,
         TEXT_PRIMARY,
     )?)?;
-    children.Append(&text_block(
-        "每一页都会印上追溯水印（打印时间、本机 IP、设备码）。文档只能输出到物理打印机，确认后消耗 1 次打印次数。",
-        12.5,
-        false,
-        TEXT_SECONDARY,
-    )?)?;
+    let wm_hint = if ui.session.print_watermark_text().is_empty() {
+        "当前文档未配置自定义水印，将按原稿页面输出。文档只能输出到物理打印机，确认后消耗 1 次打印次数。"
+    } else {
+        "自定义水印将以 80% 透明度印在页面底层（不遮挡正文与图片）。文档只能输出到物理打印机，确认后消耗 1 次打印次数。"
+    };
+    children.Append(&text_block(wm_hint, 12.5, false, TEXT_SECONDARY)?)?;
     children.Append(&text_block("选择物理打印机：", 13.5, true, TEXT_PRIMARY)?)?;
     children.Append(printer_combo)?;
     children.Append(&text_block("打印范围：", 13.5, true, TEXT_PRIMARY)?)?;
@@ -467,11 +467,8 @@ fn launch_print_job(ui: &ReaderUi, printer_name: String, pages: Vec<i32>) {
     let _ = ui.print_btn.SetIsEnabled(false);
     set_status(ui, &format!("正在向打印机“{printer_name}”提交打印任务…"));
 
-    // Time, IP and machine code are stamped onto every page regardless of the on-screen
-    // watermark settings.
-    let watermark = ui
-        .session
-        .print_watermark_text(&LocalDateTime::now().format_date_time());
+    // Printed pages render only the optional custom watermark in the bottom underlay.
+    let watermark = ui.session.print_watermark_text();
     let session = Arc::clone(&ui.session);
     let dq = ui.dq.clone();
     std::thread::spawn(move || {
