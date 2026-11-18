@@ -1,7 +1,14 @@
 //! Ergonomic `WinUI 3` dark `Fluent` control constructors, layout helpers, and `WriteableBitmap` blitting.
 
-use windows_core::{HSTRING, Interface};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use windows_collections::IVectorView;
+use windows_core::{HSTRING, Interface};
+use windows_future::AsyncOperationCompletedHandler;
+
+use crate::app::enqueue_ui;
+use crate::bindings::Microsoft::UI::Dispatching::DispatcherQueue;
 use crate::bindings::Microsoft::UI::Text::FontWeights;
 use crate::bindings::Microsoft::UI::Xaml::Controls::{
     Border, Button, CheckBox, ColumnDefinition, ComboBox, Grid, InfoBar, InfoBarSeverity,
@@ -12,8 +19,12 @@ use crate::bindings::Microsoft::UI::Xaml::Media::Imaging::WriteableBitmap;
 use crate::bindings::Microsoft::UI::Xaml::Media::{Brush, SolidColorBrush};
 use crate::bindings::Microsoft::UI::Xaml::{
     CornerRadius, FrameworkElement, GridLength, GridUnitType, HorizontalAlignment, TextWrapping,
-    Thickness, VerticalAlignment,
+    Thickness, UIElement, VerticalAlignment,
 };
+use crate::bindings::Windows::ApplicationModel::DataTransfer::{
+    DataPackageOperation, StandardDataFormats,
+};
+use crate::bindings::Windows::Storage::IStorageItem;
 use crate::bindings::Windows::UI::Color;
 use crate::interop::raw_com::IBufferByteAccess;
 
@@ -462,4 +473,104 @@ pub fn write_bgra_into_bitmap(bmp: &WriteableBitmap, bgra: &[u8]) -> windows_cor
     let dst = unsafe { core::slice::from_raw_parts_mut(ptr, cap) };
     dst.copy_from_slice(&bgra[..cap]);
     bmp.Invalidate()
+}
+
+/// Attaches STA-safe Explorer file/folder drag-and-drop handlers to `target`.
+///
+/// `DragOperationDeferral::Complete` has XAML UI-thread affinity: calling it directly from the
+/// `WinRT` `MTA` completion callback fails with `RPC_E_WRONG_THREAD` and leaves Explorer's
+/// floating `SysDragImage` icon stuck on the desktop. This helper always completes (and drops)
+/// the deferral back on `dq`'s UI thread before invoking `on_files`.
+///
+/// # Errors
+///
+/// Returns an error if enabling `AllowDrop` or subscribing `DragOver` / `Drop` fails.
+pub fn wire_file_drop<F>(
+    target: &UIElement,
+    dq: DispatcherQueue,
+    on_files: F,
+) -> windows_core::Result<()>
+where
+    F: Fn(Vec<PathBuf>) + Send + Sync + 'static,
+{
+    target.SetAllowDrop(true)?;
+    target
+        .DragOver(|_, args| {
+            if let Some(drag) = args.as_ref() {
+                let has_items = drag
+                    .DataView()
+                    .and_then(|view| {
+                        let fmt = StandardDataFormats::StorageItems()?;
+                        view.Contains(&fmt)
+                    })
+                    .unwrap_or(false);
+                let _ = drag.SetAcceptedOperation(if has_items {
+                    DataPackageOperation::Copy
+                } else {
+                    DataPackageOperation::None
+                });
+                let _ = drag.SetHandled(true);
+            }
+        })?
+        .forget();
+
+    let on_files = Arc::new(on_files);
+    target
+        .Drop(move |_, args| {
+            let Some(drag) = args.as_ref() else {
+                return;
+            };
+            let _ = drag.SetHandled(true);
+            let Ok(deferral) = drag.GetDeferral() else {
+                return;
+            };
+            let Ok(op) = drag.DataView().and_then(|v| v.GetStorageItemsAsync()) else {
+                let _ = deferral.Complete();
+                return;
+            };
+            let deferral_slot = Arc::new(Mutex::new(Some(deferral)));
+            let deferral_cb = Arc::clone(&deferral_slot);
+            let dq_cb = dq.clone();
+            let cb = Arc::clone(&on_files);
+            let handler = AsyncOperationCompletedHandler::<IVectorView<IStorageItem>>::new(
+                move |async_op, _| {
+                    let mut paths = Vec::new();
+                    if let Some(info) = async_op.as_ref()
+                        && let Ok(items) = info.GetResults()
+                        && let Ok(count) = items.Size()
+                    {
+                        for idx in 0..count {
+                            if let Ok(raw) = items.GetAt(idx)
+                                && let Ok(item) = raw.cast::<IStorageItem>()
+                                && let Ok(p) = item.Path()
+                            {
+                                paths.push(PathBuf::from(p.to_string_lossy()));
+                            }
+                        }
+                    }
+                    let deferral_ui = Arc::clone(&deferral_cb);
+                    let cb_ui = Arc::clone(&cb);
+                    let _ = enqueue_ui(&dq_cb, move || {
+                        if let Ok(mut guard) = deferral_ui.lock()
+                            && let Some(def) = guard.take()
+                        {
+                            let _ = def.Complete();
+                        }
+                        if !paths.is_empty() {
+                            cb_ui(paths);
+                        }
+                    });
+                    Ok(())
+                },
+            );
+            if op.SetCompleted(&handler).is_err()
+                && let Ok(mut guard) = deferral_slot.lock()
+                && let Some(def) = guard.take()
+            {
+                let _ = def.Complete();
+            }
+        })?
+        .forget();
+
+    Ok(())
 }

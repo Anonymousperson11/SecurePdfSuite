@@ -13,23 +13,17 @@ use secure_pdf_core::licensing::{DeviceSnapshot, collect_device_snapshot};
 use secure_pdf_core::pdf::MemoryPdfDocument;
 use secure_pdf_core::storage::LocalQuotaStore;
 use secure_pdf_core::{CoreError, QuotaStoreHealth};
-use windows_collections::IVectorView;
 use windows_core::{HSTRING, Interface};
-use windows_future::AsyncOperationCompletedHandler;
 use winui3::app::{enqueue_ui, schedule_once_timer};
 use winui3::bindings::Microsoft::UI::Dispatching::{DispatcherQueue, DispatcherQueueTimer};
 use winui3::bindings::Microsoft::UI::Xaml::Controls::{
     Border, Button, Grid, InfoBar, InfoBarSeverity, PasswordBox, TextBlock, TextBox,
 };
 use winui3::bindings::Microsoft::UI::Xaml::{FrameworkElement, HorizontalAlignment, UIElement};
-use winui3::bindings::Windows::ApplicationModel::DataTransfer::{
-    DataPackageOperation, StandardDataFormats,
-};
-use winui3::bindings::Windows::Storage::IStorageItem;
 use winui3::controls::{
     BG_CANVAS, TEXT_PRIMARY, TEXT_SECONDARY, add_grid_cols, brush_base, button, card_border,
     gl_auto, gl_px, gl_star, grid_rows, info_bar, pad, place_in_grid, scroll_viewer_vertical,
-    show_info, stack_v, text_block, text_box, uniform,
+    show_info, stack_v, text_block, text_box, uniform, wire_file_drop,
 };
 use winui3::interop::{copy_unicode_text, pick_open_files, window_hwnd};
 use winui3::window::{FluentWindow, WindowChromeOptions};
@@ -295,58 +289,15 @@ fn copy_machine_code(ui: &UnlockUi) {
 }
 
 fn wire_drop_target(root: &Grid) -> windows_core::Result<()> {
-    root.SetAllowDrop(true)?;
+    let Some(dq) = with_unlock(|ui| ui.dq.clone()) else {
+        return Ok(());
+    };
     let root_ui: UIElement = root.cast()?;
-    root_ui
-        .DragOver(|_, args| {
-            if let Some(drag) = args.as_ref()
-                && let Ok(view) = drag.DataView()
-                && let Ok(fmt) = StandardDataFormats::StorageItems()
-                && view.Contains(&fmt).unwrap_or(false)
-            {
-                let _ = drag.SetAcceptedOperation(DataPackageOperation::Copy);
-            }
-        })?
-        .forget();
-
-    root_ui
-        .Drop(|_, args| {
-            let Some(drag) = args.as_ref() else {
-                return;
-            };
-            let Some(dq) = with_unlock(|ui| ui.dq.clone()) else {
-                return;
-            };
-            let Ok(deferral) = drag.GetDeferral() else {
-                return;
-            };
-            let Ok(op) = drag.DataView().and_then(|v| v.GetStorageItemsAsync()) else {
-                let _ = deferral.Complete();
-                return;
-            };
-            let deferral_cb = deferral.clone();
-            let handler =
-                AsyncOperationCompletedHandler::<IVectorView<IStorageItem>>::new(move |info, _| {
-                    if let Some(res) = info.as_ref().and_then(|a| a.GetResults().ok())
-                        && res.Size().unwrap_or(0) > 0
-                        && let Ok(raw) = res.GetAt(0)
-                        && let Ok(item) = raw.cast::<IStorageItem>()
-                        && let Ok(p) = item.Path()
-                    {
-                        let dropped = PathBuf::from(p.to_string_lossy());
-                        let _ = enqueue_ui(&dq, move || {
-                            with_unlock(|ui| select_spdf_file(ui, dropped));
-                        });
-                    }
-                    let _ = deferral_cb.Complete();
-                    Ok(())
-                });
-            if op.SetCompleted(&handler).is_err() {
-                let _ = deferral.Complete();
-            }
-        })?
-        .forget();
-    Ok(())
+    wire_file_drop(&root_ui, dq, |paths| {
+        if let Some(first) = paths.into_iter().next() {
+            with_unlock(|ui| select_spdf_file(ui, first));
+        }
+    })
 }
 
 fn spawn_device_probe(ui: &UnlockUi) {

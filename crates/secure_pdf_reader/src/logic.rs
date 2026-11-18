@@ -19,8 +19,8 @@ pub const ZOOM_STEP: f64 = 0.15;
 
 /// Number of distinct moire phase steps before the lattice animation repeats.
 pub const MOIRE_PHASE_STEPS: u32 = 6;
-/// Minimum pause between two wheel notches before an edge scroll turns the page.
-pub const WHEEL_PAGING_PAUSE_MS: u128 = 250;
+/// Minimum cooldown after a wheel-triggered page turn before another edge notch turns again.
+pub const WHEEL_PAGING_PAUSE_MS: u128 = 200;
 /// Every this many housekeeping ticks the local authorisation record is fully re-verified.
 pub const FULL_VERIFY_EVERY_TICKS: u64 = 4;
 

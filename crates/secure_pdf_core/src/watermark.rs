@@ -403,9 +403,10 @@ pub fn paint_text_mask_layer(
         let bottom = at(x0, y1).mul_add(1.0 - fx, at(x1, y1) * fx);
         top.mul_add(1.0 - fy, bottom * fy) / 255.0
     };
+    let inv_step_y = 1.0 / step_y;
     // Coverage of the tiled text at unrotated layer coordinates `(u, v)`.
     let tiled = |u: f32, v: f32| -> f32 {
-        let row = (v / step_y).floor();
+        let row = (v * inv_step_y).floor();
         let ty = row.mul_add(-step_y, v);
         if ty >= text_h {
             return 0.0;
@@ -423,24 +424,54 @@ pub fn paint_text_mask_layer(
         (style.shadow_rgb, style.shadow_alpha, style.shadow_offset_px),
         (style.color_rgb, style.alpha, 0.0),
     ];
+    if layers.iter().all(|&(_, alpha, _)| alpha == 0) {
+        return Ok(());
+    }
+    let max_offset = if style.shadow_alpha > 0 {
+        style.shadow_offset_px.abs() + 1.0
+    } else {
+        1.0
+    };
+    let gap_low = text_h + max_offset;
+    let gap_high = step_y - max_offset;
+    let dv_dx = -sin_a;
+
     for (y, row) in bgra.chunks_exact_mut(width * 4).enumerate() {
         let dy = y as f32 + 0.5 - center_y;
-        for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let dx = x as f32 + 0.5 - center_x;
-            // Inverse of "rotate by angle, then translate to centre".
-            let u = dx.mul_add(cos_a, dy * sin_a);
-            let v = dy.mul_add(cos_a, -(dx * sin_a));
+        let dx0 = 0.5 - center_x;
+        let u0 = dx0.mul_add(cos_a, dy * sin_a);
+        let v0 = dy.mul_add(cos_a, -(dx0 * sin_a));
+        let pixels = row.as_chunks_mut::<4>().0;
+        let mut x = 0_usize;
+        while x < width {
+            let xf = x as f32;
+            let v = xf.mul_add(dv_dx, v0);
+            if gap_high > gap_low {
+                let ty = (v * inv_step_y).floor().mul_add(-step_y, v);
+                if ty > gap_low && ty < gap_high {
+                    let skip = if dv_dx > 1e-4 {
+                        ((gap_high - ty) / dv_dx) as usize
+                    } else if dv_dx < -1e-4 {
+                        ((ty - gap_low) / (-dv_dx)) as usize
+                    } else {
+                        width - x
+                    };
+                    x += skip.max(1);
+                    continue;
+                }
+            }
+            let u = xf.mul_add(cos_a, u0);
+            let px = &mut pixels[x];
             for (rgb, alpha, offset) in layers {
                 if alpha == 0 {
                     continue;
                 }
                 let cov = tiled(u - offset, v - offset);
-                if cov <= 0.0 {
-                    continue;
+                if cov > 0.0 {
+                    blend_premultiplied(px, rgb, cov * f32::from(alpha) / 255.0);
                 }
-                let a = cov * f32::from(alpha) / 255.0;
-                blend_premultiplied(px, rgb, a);
             }
+            x += 1;
         }
     }
     Ok(())

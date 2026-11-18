@@ -8,9 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use secure_pdf_core::{LocalDateTime, MoireLevel};
-use windows_collections::IVectorView;
 use windows_core::{HSTRING, Interface};
-use windows_future::AsyncOperationCompletedHandler;
 use winui3::app::enqueue_ui;
 use winui3::bindings::Microsoft::UI::Dispatching::DispatcherQueue;
 use winui3::bindings::Microsoft::UI::Xaml::Controls::{
@@ -18,16 +16,12 @@ use winui3::bindings::Microsoft::UI::Xaml::Controls::{
     ListViewSelectionMode, ProgressBar, TextBlock, TextBox,
 };
 use winui3::bindings::Microsoft::UI::Xaml::{HorizontalAlignment, TextWrapping, UIElement};
-use winui3::bindings::Windows::ApplicationModel::DataTransfer::{
-    DataPackageOperation, StandardDataFormats,
-};
-use winui3::bindings::Windows::Storage::IStorageItem;
 use winui3::bindings::Windows::UI::Color;
 use winui3::controls::{
     ACCENT_GREEN, ACCENT_RED, BG_SURFACE, TEXT_PRIMARY, TEXT_SECONDARY, add_grid_cols, brush_base,
     button, card_border, check_box, combo_box, gl_auto, gl_px, gl_star, grid_rows, hv, info_bar,
     pad, place_in_grid, progress_bar, scroll_viewer_vertical, show_info, stack_h, stack_v,
-    text_block, text_box, uniform,
+    text_block, text_box, uniform, wire_file_drop,
 };
 use winui3::dialog::show_confirm_dialog;
 use winui3::interop::{
@@ -272,7 +266,6 @@ fn build_left_column(ui: &EncryptUi) -> windows_core::Result<Grid> {
 
     // --- queue
     let queue_card = card_border(uniform(12.0))?;
-    queue_card.SetAllowDrop(true)?;
     let queue_box = stack_v(8.0)?;
     let queue_hdr = grid_rows(&[gl_auto()])?;
     add_grid_cols(&queue_hdr, &[gl_star(1.0), gl_auto()])?;
@@ -602,72 +595,11 @@ fn pick_output_dir(ui: &EncryptUi) {
 }
 
 fn wire_drag_drop(ui: &EncryptUi, target: &Grid) -> windows_core::Result<()> {
-    target.SetAllowDrop(true)?;
-    let _ = ui.queue_list.SetAllowDrop(true);
     let root_ui: UIElement = target.cast()?;
-
-    root_ui
-        .DragOver(|_, args| {
-            if let Some(drag) = args.as_ref()
-                && let Ok(view) = drag.DataView()
-                && let Ok(fmt) = StandardDataFormats::StorageItems()
-                && view.Contains(&fmt).unwrap_or(false)
-            {
-                let _ = drag.SetAcceptedOperation(DataPackageOperation::Copy);
-            }
-        })?
-        .forget();
-
     let ui_drop = ui.clone();
-    root_ui
-        .Drop(move |_, args| {
-            let Some(drag) = args.as_ref() else {
-                return;
-            };
-            let Ok(deferral) = drag.GetDeferral() else {
-                return;
-            };
-            let Ok(view) = drag.DataView() else {
-                let _ = deferral.Complete();
-                return;
-            };
-            let Ok(op) = view.GetStorageItemsAsync() else {
-                let _ = deferral.Complete();
-                return;
-            };
-            let ui_cb = ui_drop.clone();
-            let deferral_cb = deferral.clone();
-            let handler = AsyncOperationCompletedHandler::<IVectorView<IStorageItem>>::new(
-                move |async_op, _| {
-                    if let Some(info) = async_op.as_ref()
-                        && let Ok(items) = info.GetResults()
-                        && let Ok(count) = items.Size()
-                    {
-                        let mut dropped_paths = Vec::new();
-                        for idx in 0..count {
-                            if let Ok(raw_item) = items.GetAt(idx)
-                                && let Ok(storage_item) = raw_item.cast::<IStorageItem>()
-                                && let Ok(p) = storage_item.Path()
-                            {
-                                dropped_paths.push(PathBuf::from(p.to_string_lossy()));
-                            }
-                        }
-                        let ui_fin = ui_cb.clone();
-                        let _ = enqueue_ui(&ui_cb.dq, move || {
-                            add_paths_in_background(&ui_fin, dropped_paths);
-                        });
-                    }
-                    let _ = deferral_cb.Complete();
-                    Ok(())
-                },
-            );
-            if op.SetCompleted(&handler).is_err() {
-                let _ = deferral.Complete();
-            }
-        })?
-        .forget();
-
-    Ok(())
+    wire_file_drop(&root_ui, ui.dq.clone(), move |dropped_paths| {
+        add_paths_in_background(&ui_drop, dropped_paths);
+    })
 }
 
 fn wire_policy_actions(ui: &EncryptUi) -> windows_core::Result<()> {

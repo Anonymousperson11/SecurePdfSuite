@@ -11,7 +11,7 @@ use secure_pdf_core::forensics::{
 };
 use secure_pdf_core::localtime::format_unix_seconds_local;
 use secure_pdf_core::watermark::{MicrodotDecode, decode_microdots};
-use windows_core::HSTRING;
+use windows_core::{HSTRING, Interface};
 use winui3::app::enqueue_ui;
 use winui3::bindings::Microsoft::UI::Dispatching::DispatcherQueue;
 use winui3::bindings::Microsoft::UI::Xaml::Controls::{
@@ -19,11 +19,11 @@ use winui3::bindings::Microsoft::UI::Xaml::Controls::{
     ScrollMode, ScrollViewer, TextBlock,
 };
 use winui3::bindings::Microsoft::UI::Xaml::Media::{ImageSource, Stretch};
-use winui3::bindings::Microsoft::UI::Xaml::TextWrapping;
+use winui3::bindings::Microsoft::UI::Xaml::{TextWrapping, UIElement};
 use winui3::controls::{
     BG_SURFACE, TEXT_PRIMARY, TEXT_SECONDARY, add_grid_cols, brush_base, button, card_border,
     combo_box, gl_auto, gl_px, gl_star, grid_rows, info_bar, place_in_grid, scroll_viewer,
-    show_info, stack_h, stack_v, text_block, uniform, writeable_bitmap_from_bgra,
+    show_info, stack_h, stack_v, text_block, uniform, wire_file_drop, writeable_bitmap_from_bgra,
 };
 use winui3::interop::{pick_open_files, pick_save_file, window_hwnd};
 use winui3::window::FluentWindow;
@@ -161,6 +161,13 @@ pub fn build_forensics_tab(win: FluentWindow, dq: DispatcherQueue) -> windows_co
     root.Children()?.Append(&viewer_grid)?;
 
     wire_actions(&ui)?;
+    let root_ui: UIElement = root.cast()?;
+    let ui_drop = ui.clone();
+    wire_file_drop(&root_ui, ui.dq, move |paths| {
+        if let Some(first) = paths.into_iter().next() {
+            start_job(&ui_drop, Some(first));
+        }
+    })?;
     Ok(root)
 }
 

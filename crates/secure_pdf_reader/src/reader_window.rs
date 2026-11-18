@@ -116,6 +116,7 @@ pub struct ViewState {
     generation: u64,
     scroll_intent: ScrollIntent,
     shown: Option<ShownFrame>,
+    page_bitmap: Option<(WriteableBitmap, i32, i32)>,
     overlay_bitmap: Option<(WriteableBitmap, i32, i32)>,
     dpi_scale: f64,
     pub(crate) locked: bool,
@@ -312,6 +313,7 @@ fn build_ui_controls(
             generation: 0,
             scroll_intent: ScrollIntent::Top,
             shown: None,
+            page_bitmap: None,
             overlay_bitmap: None,
             dpi_scale,
             locked: false,
@@ -694,15 +696,14 @@ fn on_wheel(ui: &ReaderUi, ev: &PointerRoutedEventArgs) {
         return;
     }
 
-    // Scrolling on past the end (start) of a page turns to the next (previous) page, but only
-    // after a short pause so one long spin does not race through several pages.
+    // Cooldown applies only right after a wheel-triggered page turn so normal scrolling into the
+    // top/bottom edge turns seamlessly on the next notch without locking out trackpad gestures.
     let now = Instant::now();
     let (page_idx, paused) = {
-        let mut state = ui.state.borrow_mut();
+        let state = ui.state.borrow();
         let paused = state
             .last_wheel
             .is_none_or(|last| now.duration_since(last).as_millis() >= WHEEL_PAGING_PAUSE_MS);
-        state.last_wheel = Some(now);
         (state.page_idx, paused)
     };
     let action = wheel_paging_action(
@@ -720,10 +721,12 @@ fn on_wheel(ui: &ReaderUi, ev: &PointerRoutedEventArgs) {
         }
         WheelAction::NextPage => {
             let _ = ev.SetHandled(true);
+            ui.state.borrow_mut().last_wheel = Some(now);
             go_to_page(ui, page_idx + 1, ScrollIntent::Top);
         }
         WheelAction::PrevPageAtBottom => {
             let _ = ev.SetHandled(true);
+            ui.state.borrow_mut().last_wheel = Some(now);
             go_to_page(ui, page_idx - 1, ScrollIntent::Bottom);
         }
     }
@@ -840,15 +843,26 @@ fn keep_center_intent(ui: &ReaderUi) -> ScrollIntent {
 
 fn trigger_render(ui: &ReaderUi, intent: ScrollIntent) {
     let dpi_scale = ui.win.dpi_scale();
-    let (generation, page_index, zoom) = {
+    let (generation, page_index, zoom, reuse_overlay_size) = {
         let mut state = ui.state.borrow_mut();
         if state.locked {
             return;
         }
+        let same_dpi = (state.dpi_scale - dpi_scale).abs() <= 0.001;
+        let reuse_overlay_size = if same_dpi {
+            state.overlay_bitmap.as_ref().map(|(_, w, h)| (*w, *h))
+        } else {
+            None
+        };
         state.generation += 1;
         state.scroll_intent = intent;
         state.dpi_scale = dpi_scale;
-        (state.generation, state.page_idx, state.zoom)
+        (
+            state.generation,
+            state.page_idx,
+            state.zoom,
+            reuse_overlay_size,
+        )
     };
 
     sync_page_box(ui);
@@ -859,13 +873,14 @@ fn trigger_render(ui: &ReaderUi, intent: ScrollIntent) {
     let _ = ui
         .next_btn
         .SetIsEnabled(page_index + 1 < ui.session.page_count);
-    // The page and its overlay are rendered together, so a page never reaches the screen
-    // without its watermark.
+    // The page and its overlay are rendered together (or reuse an already live identical-size
+    // overlay), so a page never reaches the screen without its watermark.
     ui.worker.submit_page(PageJob {
         generation,
         page_index,
         zoom,
         dpi_scale,
+        reuse_overlay_size,
         overlay: overlay_spec(ui, dpi_scale),
     });
 }
@@ -892,29 +907,17 @@ fn overlay_spec(ui: &ReaderUi, dpi_scale: f64) -> OverlaySpec {
 
 /// UI-thread continuation of a finished page render.
 pub fn apply_page_result(ui: &ReaderUi, result: PageResult) {
-    let intent = {
+    let (intent, prev_shown) = {
         let state = ui.state.borrow();
         // Checked first: once locked (or superseded) nothing may be put back on screen.
         if state.locked || state.generation != result.job.generation {
             return;
         }
-        state.scroll_intent
+        (state.scroll_intent, state.shown)
     };
     let page_number = result.job.page_index + 1;
-    let prepared = result.outcome.and_then(|rendered| {
-        let layout = rendered.layout;
-        let bitmap =
-            writeable_bitmap_from_bgra(layout.px_width, layout.px_height, &rendered.page_pixels)
-                .map_err(|e| {
-                    format!(
-                        "无法创建页面位图（错误代码 0x{:08X}）",
-                        e.code().0.cast_unsigned()
-                    )
-                })?;
-        Ok((layout, bitmap, rendered.overlay_pixels))
-    });
-    let (layout, bitmap, overlay_pixels) = match prepared {
-        Ok(parts) => parts,
+    let rendered = match result.outcome {
+        Ok(rendered) => rendered,
         Err(msg) => {
             clear_page_content(ui);
             show_info(
@@ -926,38 +929,100 @@ pub fn apply_page_result(ui: &ReaderUi, result: PageResult) {
             return;
         }
     };
+    let layout = rendered.layout;
 
     // Overlay first: if the watermark cannot be shown, the page is not shown either.
-    let overlay_shown = match overlay_pixels {
-        Ok(Some(pixels)) => {
-            show_overlay_pixels(ui, layout.px_width, layout.px_height, &pixels).is_ok()
+    let overlay_shown = if rendered.reused_live_overlay {
+        let has_live = ui
+            .state
+            .borrow()
+            .overlay_bitmap
+            .as_ref()
+            .is_some_and(|(_, w, h)| *w == layout.px_width && *h == layout.px_height);
+        if has_live {
+            let _ = ui.overlay_img.SetVisibility(Visibility::Visible);
         }
-        Ok(None) => {
-            let _ = ui.overlay_img.SetVisibility(Visibility::Collapsed);
-            true
+        has_live
+    } else {
+        match rendered.overlay_pixels {
+            Ok(Some(pixels)) => {
+                show_overlay_pixels(ui, layout.px_width, layout.px_height, &pixels).is_ok()
+            }
+            Ok(None) => {
+                let _ = ui.overlay_img.SetVisibility(Visibility::Collapsed);
+                true
+            }
+            Err(_) => false,
         }
-        Err(_) => false,
     };
     if !overlay_shown {
         lock_and_close(ui, WATERMARK_FAILURE_REASON);
         return;
     }
-    let _ = ui.page_img.SetSource(&bitmap);
-    for img in [&ui.page_img, &ui.overlay_img] {
-        let _ = img.SetWidth(layout.dip_width);
-        let _ = img.SetHeight(layout.dip_height);
+
+    if let Err(err) = show_page_pixels(ui, layout.px_width, layout.px_height, &rendered.page_pixels)
+    {
+        clear_page_content(ui);
+        show_info(
+            &ui.alert,
+            InfoBarSeverity::Error,
+            "页面无法显示",
+            &format!(
+                "第 {page_number} 页无法创建页面位图（错误代码 0x{:08X}）",
+                err.code().0.cast_unsigned()
+            ),
+        );
+        return;
+    }
+
+    let size_changed = prev_shown.is_none_or(|prev| {
+        prev.px_width != layout.px_width
+            || prev.px_height != layout.px_height
+            || (prev.effective_scale - layout.effective_scale()).abs() > 1e-4
+    });
+    if size_changed {
+        for img in [&ui.page_img, &ui.overlay_img] {
+            let _ = img.SetWidth(layout.dip_width);
+            let _ = img.SetHeight(layout.dip_height);
+        }
     }
     ui.state.borrow_mut().shown = Some(ShownFrame {
         px_width: layout.px_width,
         px_height: layout.px_height,
         effective_scale: layout.effective_scale(),
     });
-    apply_scroll_intent(ui, intent);
+    apply_scroll_intent(ui, intent, size_changed);
 }
 
-fn apply_scroll_intent(ui: &ReaderUi, intent: ScrollIntent) {
+/// Uploads page pixels, reusing the existing `WriteableBitmap` while dimensions are unchanged.
+fn show_page_pixels(
+    ui: &ReaderUi,
+    width: i32,
+    height: i32,
+    pixels: &[u8],
+) -> windows_core::Result<()> {
+    let reusable = ui
+        .state
+        .borrow()
+        .page_bitmap
+        .as_ref()
+        .filter(|(_, w, h)| *w == width && *h == height)
+        .map(|(bitmap, _, _)| bitmap.clone());
+    if let Some(bitmap) = reusable {
+        write_bgra_into_bitmap(&bitmap, pixels)
+    } else {
+        let bitmap = writeable_bitmap_from_bgra(width, height, pixels)?;
+        ui.page_img.SetSource(&bitmap)?;
+        ui.state.borrow_mut().page_bitmap = Some((bitmap, width, height));
+        Ok(())
+    }
+}
+
+fn apply_scroll_intent(ui: &ReaderUi, intent: ScrollIntent, size_changed: bool) {
     let sv = &ui.scroller;
-    let _ = sv.UpdateLayout();
+    if size_changed {
+        let _ = sv.UpdateLayout();
+    }
     let (horizontal, vertical) = match intent {
         ScrollIntent::Top => (None, Some(0.0)),
         ScrollIntent::Bottom => (None, Some(sv.ScrollableHeight().unwrap_or(0.0))),
@@ -1263,14 +1328,24 @@ fn notify_locked_and_close(ui: &ReaderUi) {
     let _ = ui.win.window.Close();
 }
 
-/// Detaches the page and overlay bitmaps from the visual tree.
+/// Detaches the page and overlay bitmaps from the visual tree and wipes cached page pixels.
 fn clear_page_content(ui: &ReaderUi) {
     let _ = ui.page_img.SetSource(None::<&ImageSource>);
     let _ = ui.overlay_img.SetSource(None::<&ImageSource>);
     let _ = ui.overlay_img.SetVisibility(Visibility::Collapsed);
-    let mut state = ui.state.borrow_mut();
-    state.shown = None;
-    state.overlay_bitmap = None;
+    let old_page = {
+        let mut state = ui.state.borrow_mut();
+        state.shown = None;
+        state.overlay_bitmap = None;
+        state.page_bitmap.take()
+    };
+    if let Some((bmp, w, h)) = old_page
+        && let (Ok(wu), Ok(hu)) = (usize::try_from(w), usize::try_from(h))
+        && let Some(bytes) = wu.checked_mul(hu).and_then(|px| px.checked_mul(4))
+    {
+        let zeros = vec![0_u8; bytes];
+        let _ = write_bgra_into_bitmap(&bmp, &zeros);
+    }
 }
 
 /// Tears the reader down: stops timers and the worker, clears the images and releases the

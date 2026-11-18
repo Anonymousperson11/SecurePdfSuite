@@ -4,14 +4,19 @@
 //! every `WinUI` object stays on the UI thread and is reached through
 //! [`crate::reader_window::with_reader`] when a result is posted back.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
 use winui3::app::enqueue_ui;
 use winui3::bindings::Microsoft::UI::Dispatching::DispatcherQueue;
+use zeroize::Zeroizing;
 
 use crate::logic::{OverlaySpec, ViewLayout, compute_view_layout, render_overlay};
 use crate::reader_window::{apply_overlay_result, apply_page_result, with_reader};
 use crate::session::ReaderSession;
+
+/// Maximum number of decoded page bitmaps retained in the zeroized LRU cache.
+const MAX_CACHED_PAGES: usize = 8;
 
 /// Request to rasterize one page.
 #[derive(Clone, Debug)]
@@ -24,6 +29,9 @@ pub struct PageJob {
     pub zoom: f64,
     /// Display scale of the window (`1.0` at 96 DPI).
     pub dpi_scale: f64,
+    /// Live `(px_width, px_height)` overlay already displayed on screen that may be kept when the
+    /// new page has the exact same pixel dimensions, avoiding a blocking overlay re-render.
+    pub reuse_overlay_size: Option<(i32, i32)>,
     /// Overlay to draw for this page so page and watermark reach the screen together; its
     /// `dpi_scale` is replaced by the bitmap's real pixels-per-DIP once the layout is known.
     pub overlay: OverlaySpec,
@@ -46,11 +54,14 @@ pub struct OverlayJob {
 pub struct RenderedPage {
     /// Bitmap and display size.
     pub layout: ViewLayout,
-    /// Premultiplied `BGRA8` page pixels.
-    pub page_pixels: Vec<u8>,
+    /// Premultiplied `BGRA8` page pixels (zeroized when dropped).
+    pub page_pixels: Zeroizing<Vec<u8>>,
     /// Premultiplied `BGRA8` overlay pixels (`None` = nothing to draw), or why the overlay
     /// could not be drawn.
     pub overlay_pixels: Result<Option<Vec<u8>>, String>,
+    /// `true` when `overlay_pixels` was intentionally omitted because an identical-size live
+    /// watermark overlay is already covering the viewport.
+    pub reused_live_overlay: bool,
 }
 
 /// Rendered page (or the reason it could not be produced).
@@ -129,6 +140,89 @@ impl Drop for RenderWorker {
     }
 }
 
+type RawPage = (ViewLayout, Zeroizing<Vec<u8>>);
+
+struct CachedPage {
+    page_index: i32,
+    layout: ViewLayout,
+    pixels: Zeroizing<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct PageCache {
+    zoom_bits: u64,
+    dpi_bits: u64,
+    entries: VecDeque<CachedPage>,
+}
+
+impl PageCache {
+    fn reset_if_scale_changed(&mut self, zoom: f64, dpi_scale: f64) {
+        let zb = zoom.to_bits();
+        let db = dpi_scale.to_bits();
+        if self.zoom_bits != zb || self.dpi_bits != db {
+            self.entries.clear();
+            self.zoom_bits = zb;
+            self.dpi_bits = db;
+        }
+    }
+
+    fn get(
+        &mut self,
+        page_index: i32,
+        zoom: f64,
+        dpi_scale: f64,
+    ) -> Option<(ViewLayout, Zeroizing<Vec<u8>>)> {
+        self.reset_if_scale_changed(zoom, dpi_scale);
+        let pos = self
+            .entries
+            .iter()
+            .position(|e| e.page_index == page_index)?;
+        let hit = self.entries.remove(pos)?;
+        let out = (hit.layout, hit.pixels.clone());
+        self.entries.push_back(hit);
+        Some(out)
+    }
+
+    fn insert(
+        &mut self,
+        page_index: i32,
+        zoom: f64,
+        dpi_scale: f64,
+        layout: ViewLayout,
+        pixels: Zeroizing<Vec<u8>>,
+    ) {
+        self.reset_if_scale_changed(zoom, dpi_scale);
+        if self.entries.iter().any(|e| e.page_index == page_index) {
+            return;
+        }
+        if self.entries.len() >= MAX_CACHED_PAGES {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(CachedPage {
+            page_index,
+            layout,
+            pixels,
+        });
+    }
+
+    fn contains(&self, page_index: i32, zoom: f64, dpi_scale: f64) -> bool {
+        self.zoom_bits == zoom.to_bits()
+            && self.dpi_bits == dpi_scale.to_bits()
+            && self.entries.iter().any(|e| e.page_index == page_index)
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+fn has_pending_or_stopped(shared: &(Mutex<Queue>, Condvar)) -> bool {
+    shared
+        .0
+        .lock()
+        .is_ok_and(|q| q.shutdown || q.page.is_some() || q.overlay.is_some())
+}
+
 fn next_jobs(shared: &(Mutex<Queue>, Condvar)) -> Option<(Option<PageJob>, Option<OverlayJob>)> {
     let (lock, signal) = shared;
     let mut queue = lock.lock().ok()?;
@@ -136,24 +230,55 @@ fn next_jobs(shared: &(Mutex<Queue>, Condvar)) -> Option<(Option<PageJob>, Optio
         if queue.shutdown {
             return None;
         }
-        if queue.page.is_some() || queue.overlay.is_some() {
-            return Some((queue.page.take(), queue.overlay.take()));
+        if queue.page.is_some() {
+            // A page navigation takes priority; drop any queued timer overlay for the old page.
+            let page = queue.page.take();
+            queue.overlay = None;
+            return Some((page, None));
+        }
+        if queue.overlay.is_some() {
+            return Some((None, queue.overlay.take()));
         }
         queue = signal.wait(queue).ok()?;
     }
 }
 
 fn run(shared: &(Mutex<Queue>, Condvar), session: &ReaderSession, dq: &DispatcherQueue) {
+    let mut cache = PageCache::default();
     while let Some((page, overlay)) = next_jobs(shared) {
         if let Some(job) = page {
-            let Some(outcome) = render_page(session, &job) else {
-                // Plaintext already released: nothing may be rendered any more.
+            let cur_idx = job.page_index;
+            let cur_zoom = job.zoom;
+            let cur_dpi = job.dpi_scale;
+            let Some(outcome) = render_page_cached(session, &mut cache, &job) else {
+                // Plaintext already released: wipe cached pages and exit.
+                cache.clear();
                 return;
             };
+            let succeeded = outcome.is_ok();
             let result = PageResult { job, outcome };
             let _ = enqueue_ui(dq, move || {
                 with_reader(|ui| apply_page_result(ui, result));
             });
+
+            // Warm adjacent pages (`cur_idx + 1`, `cur_idx - 1`) while idle so flipping pages is instant.
+            if succeeded {
+                for neighbor in [cur_idx + 1, cur_idx - 1] {
+                    if neighbor < 0 || neighbor >= session.page_count {
+                        continue;
+                    }
+                    if has_pending_or_stopped(shared) {
+                        break;
+                    }
+                    if !cache.contains(neighbor, cur_zoom, cur_dpi)
+                        && prefetch_into_cache(session, &mut cache, neighbor, cur_zoom, cur_dpi)
+                            .is_none()
+                    {
+                        cache.clear();
+                        return;
+                    }
+                }
+            }
         }
         if let Some(job) = overlay {
             let pixels =
@@ -169,33 +294,101 @@ fn run(shared: &(Mutex<Queue>, Condvar), session: &ReaderSession, dq: &Dispatche
             });
         }
     }
+    cache.clear();
+}
+
+fn rasterize_raw_page(
+    session: &ReaderSession,
+    page_index: i32,
+    zoom: f64,
+    dpi_scale: f64,
+) -> Option<Result<RawPage, String>> {
+    session.with_pdf(|pdf| {
+        let (width_pts, height_pts) = pdf
+            .page_size_points(page_index)
+            .map_err(|e| e.to_string())?;
+        let layout = compute_view_layout(width_pts, height_pts, zoom, dpi_scale);
+        let pixels = pdf
+            .render_page_bgra(page_index, layout.px_width, layout.px_height)
+            .map(Zeroizing::new)
+            .map_err(|e| e.to_string())?;
+        Ok((layout, pixels))
+    })
+}
+
+fn prefetch_into_cache(
+    session: &ReaderSession,
+    cache: &mut PageCache,
+    page_index: i32,
+    zoom: f64,
+    dpi_scale: f64,
+) -> Option<()> {
+    let outcome = rasterize_raw_page(session, page_index, zoom, dpi_scale)?;
+    if let Ok((layout, pixels)) = outcome {
+        cache.insert(page_index, zoom, dpi_scale, layout, pixels);
+    }
+    Some(())
+}
+
+fn render_page_cached(
+    session: &ReaderSession,
+    cache: &mut PageCache,
+    job: &PageJob,
+) -> Option<Result<RenderedPage, String>> {
+    let page = if let Some(hit) = cache.get(job.page_index, job.zoom, job.dpi_scale) {
+        // Still verify the plaintext has not been released before serving a cached bitmap.
+        session.with_pdf(|_| ())?;
+        Ok(hit)
+    } else {
+        let fresh = rasterize_raw_page(session, job.page_index, job.zoom, job.dpi_scale)?;
+        if let Ok((layout, ref pixels)) = fresh {
+            cache.insert(
+                job.page_index,
+                job.zoom,
+                job.dpi_scale,
+                layout,
+                pixels.clone(),
+            );
+        }
+        fresh
+    };
+    Some(page.map(|(layout, page_pixels)| finish_rendered_page(layout, page_pixels, job)))
 }
 
 /// Sizes and rasterizes the page and its overlay; `None` once the plaintext has been released.
+#[cfg(test)]
 fn render_page(session: &ReaderSession, job: &PageJob) -> Option<Result<RenderedPage, String>> {
-    let page = session.with_pdf(|pdf| {
-        let (width_pts, height_pts) = pdf
-            .page_size_points(job.page_index)
-            .map_err(|e| e.to_string())?;
-        let layout = compute_view_layout(width_pts, height_pts, job.zoom, job.dpi_scale);
-        let pixels = pdf
-            .render_page_bgra(job.page_index, layout.px_width, layout.px_height)
-            .map_err(|e| e.to_string())?;
-        Ok::<_, String>((layout, pixels))
-    })?;
-    Some(page.map(|(layout, page_pixels)| {
-        let spec = OverlaySpec {
-            dpi_scale: layout.effective_scale(),
-            ..job.overlay.clone()
-        };
-        let overlay_pixels =
-            render_overlay(layout.px_width, layout.px_height, &spec).map_err(|e| e.to_string());
-        RenderedPage {
+    let mut cache = PageCache::default();
+    render_page_cached(session, &mut cache, job)
+}
+
+fn finish_rendered_page(
+    layout: ViewLayout,
+    page_pixels: Zeroizing<Vec<u8>>,
+    job: &PageJob,
+) -> RenderedPage {
+    if !job.overlay.is_empty()
+        && job.reuse_overlay_size == Some((layout.px_width, layout.px_height))
+    {
+        return RenderedPage {
             layout,
             page_pixels,
-            overlay_pixels,
-        }
-    }))
+            overlay_pixels: Ok(None),
+            reused_live_overlay: true,
+        };
+    }
+    let spec = OverlaySpec {
+        dpi_scale: layout.effective_scale(),
+        ..job.overlay.clone()
+    };
+    let overlay_pixels =
+        render_overlay(layout.px_width, layout.px_height, &spec).map_err(|e| e.to_string());
+    RenderedPage {
+        layout,
+        page_pixels,
+        overlay_pixels,
+        reused_live_overlay: false,
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +415,7 @@ mod tests {
             page_index: 0,
             zoom: 1.0,
             dpi_scale,
+            reuse_overlay_size: None,
             overlay: overlay_spec(hidden),
         }
     }
@@ -326,5 +520,46 @@ mod tests {
             )
         };
         assert!(!page_pending && !overlay_pending && stopped);
+    }
+
+    #[test]
+    fn page_cache_and_live_overlay_reuse_preserve_security_and_invalidation() {
+        let session = crate::session::test_support::session(0, "", 1);
+        let mut cache = PageCache::default();
+
+        // First render populates cache and draws overlay when `reuse_overlay_size` is `None`.
+        let first = render_page_cached(&session, &mut cache, &page_job(1.5, true))
+            .unwrap()
+            .unwrap();
+        assert!(!first.reused_live_overlay);
+        assert!(first.overlay_pixels.unwrap().is_some());
+        assert!(cache.contains(0, 1.0, 1.5));
+
+        // Matching live overlay dimensions skips redundant overlay rendering while hitting cache.
+        let reused_job = PageJob {
+            reuse_overlay_size: Some((first.layout.px_width, first.layout.px_height)),
+            ..page_job(1.5, true)
+        };
+        let fast = render_page_cached(&session, &mut cache, &reused_job)
+            .unwrap()
+            .unwrap();
+        assert!(fast.reused_live_overlay);
+        assert_eq!(fast.overlay_pixels, Ok(None));
+        assert_eq!(fast.page_pixels.len(), first.page_pixels.len());
+
+        // Mismatched dimensions must NOT reuse the old overlay; a fresh overlay is rendered.
+        let wrong_size_job = PageJob {
+            reuse_overlay_size: Some((800, 600)),
+            ..page_job(1.5, true)
+        };
+        let fresh = render_page_cached(&session, &mut cache, &wrong_size_job)
+            .unwrap()
+            .unwrap();
+        assert!(!fresh.reused_live_overlay);
+        assert!(fresh.overlay_pixels.unwrap().is_some());
+
+        // Once plaintext is released, even a warm cache refuses to return page pixels.
+        session.release_plaintext();
+        assert!(render_page_cached(&session, &mut cache, &reused_job).is_none());
     }
 }
