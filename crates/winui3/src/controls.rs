@@ -5,8 +5,8 @@ use windows_core::{HSTRING, Interface};
 use crate::bindings::Microsoft::UI::Text::FontWeights;
 use crate::bindings::Microsoft::UI::Xaml::Controls::{
     Border, Button, CheckBox, ColumnDefinition, ComboBox, Grid, InfoBar, InfoBarSeverity,
-    Orientation, PasswordBox, ProgressBar, RowDefinition, ScrollBarVisibility, ScrollViewer,
-    StackPanel, TextBlock, TextBox,
+    Orientation, PasswordBox, ProgressBar, RowDefinition, ScrollBarVisibility, ScrollMode,
+    ScrollViewer, StackPanel, TextBlock, TextBox,
 };
 use crate::bindings::Microsoft::UI::Xaml::Media::Imaging::WriteableBitmap;
 use crate::bindings::Microsoft::UI::Xaml::Media::{Brush, SolidColorBrush};
@@ -378,20 +378,36 @@ pub fn progress_bar() -> windows_core::Result<ProgressBar> {
     Ok(bar)
 }
 
-/// Configures a `ScrollViewer` with optional zoom support.
+/// Configures a `ScrollViewer` with optional horizontal and vertical scrollbars.
 ///
 /// # Errors
 ///
 /// Returns an error if `ScrollViewer` creation fails.
 pub fn scroll_viewer(auto_scrollbars: bool) -> windows_core::Result<ScrollViewer> {
     let sv = ScrollViewer::new()?;
-    let vis = if auto_scrollbars {
-        ScrollBarVisibility::Auto
+    let (mode, vis) = if auto_scrollbars {
+        (ScrollMode::Auto, ScrollBarVisibility::Auto)
     } else {
-        ScrollBarVisibility::Disabled
+        (ScrollMode::Disabled, ScrollBarVisibility::Disabled)
     };
+    sv.SetHorizontalScrollMode(mode)?;
+    sv.SetVerticalScrollMode(mode)?;
     sv.SetHorizontalScrollBarVisibility(vis)?;
     sv.SetVerticalScrollBarVisibility(vis)?;
+    Ok(sv)
+}
+
+/// Configures a vertical-only `ScrollViewer` whose content stretches and wraps horizontally.
+///
+/// # Errors
+///
+/// Returns an error if `ScrollViewer` creation fails.
+pub fn scroll_viewer_vertical() -> windows_core::Result<ScrollViewer> {
+    let sv = ScrollViewer::new()?;
+    sv.SetHorizontalScrollMode(ScrollMode::Disabled)?;
+    sv.SetHorizontalScrollBarVisibility(ScrollBarVisibility::Disabled)?;
+    sv.SetVerticalScrollMode(ScrollMode::Auto)?;
+    sv.SetVerticalScrollBarVisibility(ScrollBarVisibility::Auto)?;
     Ok(sv)
 }
 

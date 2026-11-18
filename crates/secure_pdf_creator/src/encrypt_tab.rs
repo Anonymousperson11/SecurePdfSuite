@@ -26,7 +26,8 @@ use winui3::bindings::Windows::UI::Color;
 use winui3::controls::{
     ACCENT_GREEN, ACCENT_RED, BG_SURFACE, TEXT_PRIMARY, TEXT_SECONDARY, add_grid_cols, brush_base,
     button, card_border, check_box, combo_box, gl_auto, gl_px, gl_star, grid_rows, hv, info_bar,
-    pad, place_in_grid, progress_bar, show_info, stack_h, stack_v, text_block, text_box, uniform,
+    pad, place_in_grid, progress_bar, scroll_viewer_vertical, show_info, stack_h, stack_v,
+    text_block, text_box, uniform,
 };
 use winui3::dialog::show_confirm_dialog;
 use winui3::interop::{
@@ -107,8 +108,8 @@ pub fn build_encrypt_tab(
     flags: SessionFlags,
 ) -> windows_core::Result<Grid> {
     let root = grid_rows(&[gl_star(1.0)])?;
-    add_grid_cols(&root, &[gl_star(1.5), gl_px(16.0), gl_star(0.8)])?;
-    root.SetPadding(uniform(16.0))?;
+    add_grid_cols(&root, &[gl_star(1.45), gl_px(14.0), gl_star(0.9)])?;
+    root.SetPadding(uniform(14.0))?;
 
     let state = Arc::new(Mutex::new(EncryptState::default()));
     let ui = create_widgets(win, dq, state, flags)?;
@@ -138,11 +139,11 @@ fn create_widgets(
 ) -> windows_core::Result<EncryptUi> {
     let queue_list = ListView::new()?;
     queue_list.SetSelectionMode(ListViewSelectionMode::Single)?;
-    queue_list.SetHeight(118.0)?;
+    queue_list.SetHeight(98.0)?;
 
     let results_list = ListView::new()?;
     results_list.SetSelectionMode(ListViewSelectionMode::Single)?;
-    results_list.SetMinHeight(140.0)?;
+    results_list.SetMinHeight(96.0)?;
 
     let prints_box = text_box("0 表示禁止打印，最多 1000", false)?;
     prints_box.SetText(&HSTRING::from("1"))?;
@@ -153,7 +154,7 @@ fn create_widgets(
     custom_hours_box.SetText(&HSTRING::from("12"))?;
     custom_hours_box.SetIsEnabled(false)?;
 
-    let moire_combo = combo_box(&["关闭", "低（最清晰）", "中（推荐）", "高（强干扰）"], 2)?;
+    let moire_combo = combo_box(&["关闭", "低（推荐，最清晰）", "中", "高（强干扰）"], 1)?;
 
     let out_dir_box = text_box("留空则输出到每个原文件所在的文件夹", false)?;
 
@@ -170,7 +171,7 @@ fn create_widgets(
         expiry_combo,
         custom_hours_box,
         moire_combo,
-        chk_visible_wm: check_box("在页面上叠加半透明可见水印", true)?,
+        chk_visible_wm: check_box("在页面上叠加半透明可见水印（可选明水印）", false)?,
         chk_hidden_wm: check_box("启用隐形溯源水印（时间、IP、设备码）", true)?,
         chk_blur_unfocus: check_box("阅读窗口失去焦点时自动遮挡内容", true)?,
         chk_adjust_moire: check_box("允许接收方调节摩尔纹强度", false)?,
@@ -486,7 +487,7 @@ fn refresh_queue_count(ui: &EncryptUi) {
 }
 
 fn labeled(label: &str, control: &UIElement) -> windows_core::Result<UIElement> {
-    let panel = stack_v(4.0)?;
+    let panel = stack_v(3.0)?;
     panel
         .Children()?
         .Append(&text_block(label, 12.5, false, TEXT_SECONDARY)?)?;
@@ -495,8 +496,13 @@ fn labeled(label: &str, control: &UIElement) -> windows_core::Result<UIElement> 
 }
 
 fn build_right_column(ui: &EncryptUi) -> windows_core::Result<Border> {
-    let card = card_border(uniform(16.0))?;
-    let col = stack_v(10.0)?;
+    let card = card_border(uniform(14.0))?;
+    let card_grid = grid_rows(&[gl_star(1.0), gl_auto()])?;
+    card_grid.SetRowSpacing(10.0)?;
+
+    let scroller = scroll_viewer_vertical()?;
+    let col = stack_v(8.0)?;
+    col.SetPadding(pad(0.0, 0.0, 6.0, 2.0))?;
 
     col.Children()?
         .Append(&text_block("安全策略", 16.0, true, TEXT_PRIMARY)?)?;
@@ -552,12 +558,18 @@ fn build_right_column(ui: &EncryptUi) -> windows_core::Result<Border> {
         &out_row.cast()?,
     )?)?;
 
+    scroller.SetContent(&col)?;
+
     ui.start_btn
         .SetHorizontalAlignment(HorizontalAlignment::Stretch)?;
-    ui.start_btn.SetMargin(pad(0.0, 8.0, 0.0, 0.0))?;
-    col.Children()?.Append(&ui.start_btn)?;
+    ui.start_btn.SetPadding(hv(14.0, 9.0))?;
 
-    card.SetChild(&col)?;
+    place_in_grid(&scroller, 0, 0, 1, 1)?;
+    place_in_grid(&ui.start_btn, 1, 0, 1, 1)?;
+    card_grid.Children()?.Append(&scroller)?;
+    card_grid.Children()?.Append(&ui.start_btn)?;
+
+    card.SetChild(&card_grid)?;
     Ok(card)
 }
 
@@ -719,18 +731,18 @@ fn read_policy_input(ui: &EncryptUi) -> Result<BatchPolicyInput, String> {
             .unwrap_or_default()
             .to_string_lossy(),
     )?;
-    let moire_level = match ui.moire_combo.SelectedIndex().unwrap_or(2) {
+    let moire_level = match ui.moire_combo.SelectedIndex().unwrap_or(1) {
         0 => MoireLevel::Off,
-        1 => MoireLevel::Low,
+        2 => MoireLevel::Medium,
         3 => MoireLevel::High,
-        _ => MoireLevel::Medium,
+        _ => MoireLevel::Low,
     };
     // A box that cannot be read counts as its safe state: protections on, moire adjustment off.
     let toggles = [
         (PolicyOption::HiddenWatermark, &ui.chk_hidden_wm, true),
         (PolicyOption::BlurOnUnfocus, &ui.chk_blur_unfocus, true),
         (PolicyOption::AllowAdjustMoire, &ui.chk_adjust_moire, false),
-        (PolicyOption::VisibleWatermark, &ui.chk_visible_wm, true),
+        (PolicyOption::VisibleWatermark, &ui.chk_visible_wm, false),
     ];
     let options = toggles
         .into_iter()

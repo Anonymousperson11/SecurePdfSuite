@@ -1135,16 +1135,16 @@ mod tests {
         // below red, and never more opaque than text, shadow and a microdot stacked together.
         for px in overlay.as_chunks::<4>().0 {
             assert!(px[0] >= px[2], "blue {} < red {}", px[0], px[2]);
-            assert!(px[3] <= 42, "alpha {}", px[3]);
+            assert!(px[3] <= 24, "alpha {}", px[3]);
         }
         // The anchor dot of the first microdot tile is present at its fixed position.
         let unit = microdot_unit_px(1.0);
         let (wu, _) = dims(w, h);
         let anchor = (5 * unit * wu + 5 * unit) * 4;
-        assert!(overlay[anchor + 3] >= 14 && overlay[anchor] > overlay[anchor + 2]);
+        assert!(overlay[anchor + 3] >= 7 && overlay[anchor] > overlay[anchor + 2]);
         // Both the tiled text and the dots are there, well beyond a handful of pixels.
         assert!(
-            opaque_pixels(&overlay) > 20_000,
+            opaque_pixels(&overlay) > 12_000,
             "{}",
             opaque_pixels(&overlay)
         );
@@ -1153,12 +1153,12 @@ mod tests {
         assert_eq!(found.payload.ipv4, Ipv4Addr::new(192, 168, 31, 207));
         assert_eq!(found.payload.unix_seconds, TRACE_UNIX);
 
-        // On a white page the hidden layer stays faint: even where a glyph crosses a microdot
-        // the red channel drops by less than 14 %.
+        // On a white page the hidden layer stays near-imperceptible: even where a glyph crosses a
+        // microdot the red channel drops by less than 8 %.
         let white = vec![255_u8; dims(w, h).0 * dims(w, h).1 * 4];
         let shown = composite_overlay_over_page(&white, &overlay);
         let darkest = shown.as_chunks::<4>().0.iter().map(|p| p[0]).min().unwrap();
-        assert!(darkest >= 220, "hidden layer too visible: {darkest}");
+        assert!(darkest >= 235, "hidden layer too visible: {darkest}");
     }
 
     #[test]
@@ -1169,7 +1169,7 @@ mod tests {
             .unwrap();
         let white = vec![255_u8; dims(w, h).0 * dims(w, h).1 * 4];
         let shown = capture(w, h, &overlay, &white);
-        // Dark slate at alpha 34 takes a white page down by about 30 levels on glyph pixels.
+        // Subtle slate at alpha 18 takes a white page down by about 16 levels on glyph pixels.
         let darkest = shown
             .rgba
             .as_chunks::<4>()
@@ -1178,15 +1178,15 @@ mod tests {
             .map(|p| p[0])
             .min()
             .unwrap();
-        assert!(darkest <= 231, "visible watermark too faint: {darkest}");
+        assert!(darkest <= 241, "visible watermark too faint: {darkest}");
         let marked = shown
             .rgba
             .as_chunks::<4>()
             .0
             .iter()
-            .filter(|p| p[0] <= 240)
+            .filter(|p| p[0] <= 247)
             .count();
-        assert!(marked > 2_000, "only {marked} clearly marked pixels");
+        assert!(marked > 1_200, "only {marked} clearly marked pixels");
         assert_eq!(decode_microdots(&shown), None);
         // No microdot tile grid: nothing at the anchor position of the first tile is blue.
         let unit = microdot_unit_px(1.0);
@@ -1340,7 +1340,7 @@ mod tests {
                 // Centre of the first anchor dot in every tile.
                 let idx = ((ty + 6 * unit) * wu + tx + 6 * unit) * 4;
                 assert!(
-                    overlay[idx + 3] >= 14,
+                    overlay[idx + 3] >= 7,
                     "anchor missing in tile at ({tx},{ty})"
                 );
                 tiles += 1;

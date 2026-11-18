@@ -28,8 +28,8 @@ use winui3::bindings::Windows::ApplicationModel::DataTransfer::{
 use winui3::bindings::Windows::Storage::IStorageItem;
 use winui3::controls::{
     BG_CANVAS, TEXT_PRIMARY, TEXT_SECONDARY, add_grid_cols, brush_base, button, card_border,
-    gl_auto, gl_px, gl_star, grid_rows, info_bar, pad, place_in_grid, show_info, stack_v,
-    text_block, text_box, uniform,
+    gl_auto, gl_px, gl_star, grid_rows, info_bar, pad, place_in_grid, scroll_viewer_vertical,
+    show_info, stack_v, text_block, text_box, uniform,
 };
 use winui3::interop::{copy_unicode_text, pick_open_files, window_hwnd};
 use winui3::window::{FluentWindow, WindowChromeOptions};
@@ -87,8 +87,8 @@ pub fn open_unlock_window(initial_spdf: Option<PathBuf>) -> Result<(), WindowOpe
     let win = create_protected_window(&WindowChromeOptions {
         title: "SecurePdf 安全阅读器 — 打开受保护文档".to_owned(),
         width_dip: 580,
-        height_dip: 610,
-        resizable: false,
+        height_dip: 630,
+        resizable: true,
         maximizable: false,
         minimizable: true,
         always_on_top: false,
@@ -106,13 +106,15 @@ fn build_and_show(
     initial_spdf: Option<PathBuf>,
 ) -> Result<(), WindowOpenError> {
     let dq = win.dispatcher_queue()?;
-    let root = grid_rows(&[gl_auto()])?;
+    let root = grid_rows(&[gl_star(1.0)])?;
     root.SetBackground(&brush_base(BG_CANVAS)?)?;
-    root.SetPadding(uniform(20.0))?;
 
     let ui = Rc::new(create_widgets(win.clone(), dq)?);
     let card = layout_unlock_card(&ui)?;
-    root.Children()?.Append(&card)?;
+    card.SetMargin(uniform(20.0))?;
+    let scroller = scroll_viewer_vertical()?;
+    scroller.SetContent(&card)?;
+    root.Children()?.Append(&scroller)?;
     UNLOCK_UI.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&ui)));
 
     wire_events(&ui, &root)?;

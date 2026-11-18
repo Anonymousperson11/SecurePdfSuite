@@ -15,7 +15,8 @@ use windows_core::HSTRING;
 use winui3::app::enqueue_ui;
 use winui3::bindings::Microsoft::UI::Dispatching::DispatcherQueue;
 use winui3::bindings::Microsoft::UI::Xaml::Controls::{
-    Button, ComboBox, Grid, Image, InfoBar, InfoBarSeverity, ScrollViewer, TextBlock,
+    Border, Button, ComboBox, Grid, Image, InfoBar, InfoBarSeverity, ScrollBarVisibility,
+    ScrollMode, ScrollViewer, TextBlock,
 };
 use winui3::bindings::Microsoft::UI::Xaml::Media::{ImageSource, Stretch};
 use winui3::bindings::Microsoft::UI::Xaml::TextWrapping;
@@ -30,7 +31,7 @@ use winui3::window::FluentWindow;
 use crate::logic::{BusyGuard, forensics_preview_bgra8};
 
 const IDLE_HINT: &str = "请选择疑似泄密的截图或翻拍照片。超大照片会自动缩小到 5000 万像素以内再处理；\
-                         界面预览最长边为 3000 像素，保存的取证图为完整分辨率。";
+                         支持放大查看细节，保存的取证图为完整分辨率。";
 const NO_MATRIX_TEXT: &str = "微点矩阵：未在图片中找到。微点只能从原始比例的截图中解码；\
                               翻拍照片或缩放过的图片请查看右侧增强结果中的隐形水印文字（IP、时间、设备码）。";
 
@@ -38,6 +39,9 @@ const NO_MATRIX_TEXT: &str = "微点矩阵：未在图片中找到。微点只�
 struct ForensicsState {
     source: Option<Arc<ForensicsImage>>,
     enhanced: Option<Arc<ForensicsImage>>,
+    preview_size: Option<(u32, u32)>,
+    /// `None` fits the image inside the pane; `Some(scale)` zooms relative to preview dimensions.
+    zoom: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -46,11 +50,19 @@ struct ForensicsUi {
     dq: DispatcherQueue,
     state: Arc<Mutex<ForensicsState>>,
     busy: Arc<AtomicBool>,
+    syncing_scroll: Arc<AtomicBool>,
     mode_combo: ComboBox,
     load_btn: Button,
     save_btn: Button,
+    zoom_out_btn: Button,
+    zoom_fit_btn: Button,
+    zoom_100_btn: Button,
+    zoom_in_btn: Button,
+    zoom_tb: TextBlock,
     meta_tb: TextBlock,
     trace_tb: TextBlock,
+    orig_sv: ScrollViewer,
+    enh_sv: ScrollViewer,
     orig_img: Image,
     enh_img: Image,
     alert: InfoBar,
@@ -103,12 +115,24 @@ pub fn build_forensics_tab(win: FluentWindow, dq: DispatcherQueue) -> windows_co
 
     let ui = create_widgets(win, dq)?;
 
-    let toolbar = card_border(uniform(12.0))?;
-    let row = stack_h(10.0)?;
+    let toolbar = card_border(uniform(10.0))?;
+    let toolbar_grid = grid_rows(&[gl_auto()])?;
+    add_grid_cols(&toolbar_grid, &[gl_star(1.0), gl_auto()])?;
+    let row = stack_h(8.0)?;
     row.Children()?.Append(&ui.load_btn)?;
     row.Children()?.Append(&ui.mode_combo)?;
     row.Children()?.Append(&ui.save_btn)?;
-    toolbar.SetChild(&row)?;
+    let zoom_row = stack_h(6.0)?;
+    zoom_row.Children()?.Append(&ui.zoom_out_btn)?;
+    zoom_row.Children()?.Append(&ui.zoom_tb)?;
+    zoom_row.Children()?.Append(&ui.zoom_in_btn)?;
+    zoom_row.Children()?.Append(&ui.zoom_fit_btn)?;
+    zoom_row.Children()?.Append(&ui.zoom_100_btn)?;
+    place_in_grid(&row, 0, 0, 1, 1)?;
+    place_in_grid(&zoom_row, 0, 1, 1, 1)?;
+    toolbar_grid.Children()?.Append(&row)?;
+    toolbar_grid.Children()?.Append(&zoom_row)?;
+    toolbar.SetChild(&toolbar_grid)?;
 
     let status_strip = stack_v(6.0)?;
     status_strip.Children()?.Append(&ui.meta_tb)?;
@@ -118,8 +142,12 @@ pub fn build_forensics_tab(win: FluentWindow, dq: DispatcherQueue) -> windows_co
     let viewer_grid = grid_rows(&[gl_star(1.0)])?;
     add_grid_cols(&viewer_grid, &[gl_star(1.0), gl_px(12.0), gl_star(1.0)])?;
 
-    let left_card = build_image_pane("原始图片（已按拍摄方向转正）", &ui.orig_img)?;
-    let right_card = build_image_pane("增强结果（可辨认隐藏的 IP、时间、设备码）", &ui.enh_img)?;
+    let left_card = build_image_pane("原始图片（已按拍摄方向转正）", &ui.orig_sv, &ui.orig_img)?;
+    let right_card = build_image_pane(
+        "增强结果（可辨认隐藏的 IP、时间、设备码）",
+        &ui.enh_sv,
+        &ui.enh_img,
+    )?;
     place_in_grid(&left_card, 0, 0, 1, 1)?;
     place_in_grid(&right_card, 0, 2, 1, 1)?;
     viewer_grid.Children()?.Append(&left_card)?;
@@ -145,15 +173,20 @@ fn create_widgets(win: FluentWindow, dq: DispatcherQueue) -> windows_core::Resul
         ],
         0,
     )?;
-    mode_combo.SetMinWidth(300.0)?;
+    mode_combo.SetMinWidth(270.0)?;
 
     let save_btn = button("保存增强取证图...", false)?;
     save_btn.SetIsEnabled(false)?;
 
+    let orig_sv = scroll_viewer(false)?;
+    let enh_sv = scroll_viewer(false)?;
     let orig_img = Image::new()?;
     orig_img.SetStretch(Stretch::Uniform)?;
     let enh_img = Image::new()?;
     enh_img.SetStretch(Stretch::Uniform)?;
+
+    let zoom_tb = text_block("适应窗口", 12.5, true, TEXT_SECONDARY)?;
+    zoom_tb.SetMinWidth(56.0)?;
 
     let meta_tb = text_block(IDLE_HINT, 12.5, false, TEXT_SECONDARY)?;
     meta_tb.SetTextWrapping(TextWrapping::Wrap)?;
@@ -166,11 +199,19 @@ fn create_widgets(win: FluentWindow, dq: DispatcherQueue) -> windows_core::Resul
         dq,
         state: Arc::new(Mutex::new(ForensicsState::default())),
         busy: Arc::new(AtomicBool::new(false)),
+        syncing_scroll: Arc::new(AtomicBool::new(false)),
         mode_combo,
         load_btn: button("选择疑似泄密的截图或照片...", true)?,
         save_btn,
+        zoom_out_btn: button("缩小 -", false)?,
+        zoom_fit_btn: button("适应窗口", false)?,
+        zoom_100_btn: button("100%", false)?,
+        zoom_in_btn: button("放大 +", false)?,
+        zoom_tb,
         meta_tb,
         trace_tb,
+        orig_sv,
+        enh_sv,
         orig_img,
         enh_img,
         alert: info_bar()?,
@@ -179,19 +220,19 @@ fn create_widgets(win: FluentWindow, dq: DispatcherQueue) -> windows_core::Resul
 
 fn build_image_pane(
     heading: &str,
+    sv: &ScrollViewer,
     img_ctrl: &Image,
-) -> windows_core::Result<winui3::bindings::Microsoft::UI::Xaml::Controls::Border> {
+) -> windows_core::Result<Border> {
     let card = card_border(uniform(12.0))?;
     let grid = grid_rows(&[gl_auto(), gl_star(1.0)])?;
     grid.SetRowSpacing(8.0)?;
     let hdr = text_block(heading, 14.0, true, TEXT_PRIMARY)?;
-    let sv: ScrollViewer = scroll_viewer(true)?;
     sv.SetBackground(&brush_base(BG_SURFACE)?)?;
     sv.SetContent(img_ctrl)?;
     place_in_grid(&hdr, 0, 0, 1, 1)?;
-    place_in_grid(&sv, 1, 0, 1, 1)?;
+    place_in_grid(sv, 1, 0, 1, 1)?;
     grid.Children()?.Append(&hdr)?;
-    grid.Children()?.Append(&sv)?;
+    grid.Children()?.Append(sv)?;
     card.SetChild(&grid)?;
     Ok(card)
 }
@@ -218,7 +259,98 @@ fn wire_actions(ui: &ForensicsUi) -> windows_core::Result<()> {
         .Click(move |_, _| handle_save_png(&ui_s))?
         .forget();
 
+    let ui_out = ui.clone();
+    ui.zoom_out_btn
+        .Click(move |_, _| step_zoom(&ui_out, -0.25))?
+        .forget();
+
+    let ui_in = ui.clone();
+    ui.zoom_in_btn
+        .Click(move |_, _| step_zoom(&ui_in, 0.25))?
+        .forget();
+
+    let ui_fit = ui.clone();
+    ui.zoom_fit_btn
+        .Click(move |_, _| set_zoom(&ui_fit, None))?
+        .forget();
+
+    let ui_full = ui.clone();
+    ui.zoom_100_btn
+        .Click(move |_, _| set_zoom(&ui_full, Some(1.0)))?
+        .forget();
+
+    let sync_lr = ui.syncing_scroll.clone();
+    let orig_for_lr = ui.orig_sv.clone();
+    let enh_for_lr = ui.enh_sv.clone();
+    ui.orig_sv
+        .ViewChanged(move |_, _| mirror_scroll(&orig_for_lr, &enh_for_lr, &sync_lr))?
+        .forget();
+
+    let sync_rl = ui.syncing_scroll.clone();
+    let orig_for_rl = ui.orig_sv.clone();
+    let enh_for_rl = ui.enh_sv.clone();
+    ui.enh_sv
+        .ViewChanged(move |_, _| mirror_scroll(&enh_for_rl, &orig_for_rl, &sync_rl))?
+        .forget();
+
     Ok(())
+}
+
+fn mirror_scroll(from: &ScrollViewer, to: &ScrollViewer, lock: &Arc<AtomicBool>) {
+    let Some(_guard) = BusyGuard::try_acquire(lock) else {
+        return;
+    };
+    let h = from.HorizontalOffset().ok();
+    let v = from.VerticalOffset().ok();
+    let _ = to.ChangeViewWithOptionalAnimation(h, v, None, true);
+}
+
+fn step_zoom(ui: &ForensicsUi, delta: f64) {
+    let base = ui.state().zoom.unwrap_or(0.5);
+    let next = (base + delta).clamp(0.25, 3.0);
+    set_zoom(ui, Some(next));
+}
+
+fn set_zoom(ui: &ForensicsUi, zoom: Option<f64>) {
+    ui.state().zoom = zoom;
+    apply_zoom_layout(ui);
+}
+
+fn apply_zoom_layout(ui: &ForensicsUi) {
+    let (preview_size, zoom) = {
+        let st = ui.state();
+        (st.preview_size, st.zoom)
+    };
+    if let (Some((pw, ph)), Some(scale)) = (preview_size, zoom) {
+        let label = format!("{:.0}%", scale * 100.0);
+        let _ = ui.zoom_tb.SetText(&HSTRING::from(label));
+        for sv in [&ui.orig_sv, &ui.enh_sv] {
+            let _ = sv.SetHorizontalScrollMode(ScrollMode::Auto);
+            let _ = sv.SetVerticalScrollMode(ScrollMode::Auto);
+            let _ = sv.SetHorizontalScrollBarVisibility(ScrollBarVisibility::Auto);
+            let _ = sv.SetVerticalScrollBarVisibility(ScrollBarVisibility::Auto);
+        }
+        let w_dip = (f64::from(pw) * scale).max(64.0);
+        let h_dip = (f64::from(ph) * scale).max(64.0);
+        for img in [&ui.orig_img, &ui.enh_img] {
+            let _ = img.SetStretch(Stretch::Fill);
+            let _ = img.SetWidth(w_dip);
+            let _ = img.SetHeight(h_dip);
+        }
+    } else {
+        let _ = ui.zoom_tb.SetText(&HSTRING::from("适应窗口"));
+        for sv in [&ui.orig_sv, &ui.enh_sv] {
+            let _ = sv.SetHorizontalScrollMode(ScrollMode::Disabled);
+            let _ = sv.SetVerticalScrollMode(ScrollMode::Disabled);
+            let _ = sv.SetHorizontalScrollBarVisibility(ScrollBarVisibility::Disabled);
+            let _ = sv.SetVerticalScrollBarVisibility(ScrollBarVisibility::Disabled);
+        }
+        for img in [&ui.orig_img, &ui.enh_img] {
+            let _ = img.SetStretch(Stretch::Uniform);
+            let _ = img.SetWidth(f64::NAN);
+            let _ = img.SetHeight(f64::NAN);
+        }
+    }
 }
 
 fn handle_load_image(ui: &ForensicsUi) {
@@ -378,10 +510,12 @@ fn show_job_output(ui: &ForensicsUi, job: JobOutput) {
         {
             let mut st = ui.state();
             st.source = Some(preview.image.clone());
+            st.preview_size = Some((preview.width, preview.height));
             // The previous enhancement belongs to the previous picture.
             st.enhanced = None;
         }
         preview.show_in(&ui.orig_img);
+        apply_zoom_layout(ui);
         let _ = ui.enh_img.SetSource(None::<&ImageSource>);
         let _ = ui
             .trace_tb

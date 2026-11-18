@@ -53,8 +53,8 @@ fn main() {
 fn build_creator_window() -> windows_core::Result<()> {
     let win = FluentWindow::new(&WindowChromeOptions {
         title: APP_TITLE.to_owned(),
-        width_dip: 1240,
-        height_dip: 820,
+        width_dip: 1260,
+        height_dip: 860,
         resizable: true,
         maximizable: true,
         minimizable: true,
@@ -69,7 +69,7 @@ fn build_creator_window() -> windows_core::Result<()> {
     root.SetBackground(&brush_base(BG_CANVAS)?)?;
 
     let hdr = stack_v(2.0)?;
-    hdr.SetPadding(hv(20.0, 12.0))?;
+    hdr.SetPadding(hv(20.0, 8.0))?;
     hdr.Children()?
         .Append(&text_block("SecurePdf 创建端", 20.0, true, TEXT_PRIMARY)?)?;
     hdr.Children()?.Append(&text_block(

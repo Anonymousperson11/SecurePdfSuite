@@ -299,20 +299,9 @@ pub fn enhance_image(src: &ForensicsImage, mode: EnhanceMode) -> CoreResult<Fore
         ));
     }
 
-    let chroma_r = adaptive_window_radius(18, src.width, src.height);
-    let adaptive_r = adaptive_window_radius(15, src.width, src.height);
     let out_rgba = match mode {
-        EnhanceMode::ChromaStegoExtract => {
-            enhance_local_window(src, chroma_r, 11.0, 0.25, 225.0, chroma_stego_signal)
-        }
-        EnhanceMode::AdaptiveBackgroundSubtract => enhance_local_window(
-            src,
-            adaptive_r,
-            9.0,
-            1.0 / 256.0,
-            128.0,
-            luminance_weighted_signal,
-        ),
+        EnhanceMode::ChromaStegoExtract => enhance_chroma_watermark(src),
+        EnhanceMode::AdaptiveBackgroundSubtract => enhance_adaptive_background(src),
         EnhanceMode::GlobalEqualizeAndInvert => enhance_global_equalize_invert(src),
     };
 
@@ -340,128 +329,231 @@ pub fn save_png(path: &Path, img: &ForensicsImage) -> CoreResult<()> {
     Ok(())
 }
 
-#[inline]
-const fn chroma_stego_signal(r: i32, g: i32, b: i32) -> i32 {
-    3 * (b - r) + (b - g)
-}
-
-#[inline]
-const fn luminance_weighted_signal(r: i32, g: i32, b: i32) -> i32 {
-    r * 77 + g * 150 + b * 29
-}
-
-/// Scales the local background window proportionally on multi-megapixel camera captures so the
-/// window remains wider than glyph strokes, while keeping `base_radius` exact up to `1200` px.
-fn adaptive_window_radius(base_radius: usize, width: u32, height: u32) -> usize {
-    let longer = usize::try_from(width.max(height)).unwrap_or(base_radius);
-    if longer <= 1_200 {
-        base_radius
-    } else {
-        (base_radius.saturating_mul(longer) / 1_200).clamp(base_radius, 96)
+/// O(W*H) separable box blur repeated `passes` times (3 passes approximate an isotropic Gaussian
+/// with zero rectangular halo artifacts).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::suboptimal_flops
+)]
+fn blur_box_passes(src: &[f32], w: usize, h: usize, radius: usize, passes: usize) -> Vec<f32> {
+    if radius == 0 || passes == 0 || w == 0 || h == 0 {
+        return src.to_vec();
     }
+    let mut cur = src.to_vec();
+    let mut tmp = vec![0.0_f32; w * h];
+    let mut pref = vec![0.0_f64; w.max(h) + 1];
+
+    for _ in 0..passes {
+        for y in 0..h {
+            let row_off = y * w;
+            pref[0] = 0.0;
+            for x in 0..w {
+                pref[x + 1] = pref[x] + f64::from(cur[row_off + x]);
+            }
+            for x in 0..w {
+                let x0 = x.saturating_sub(radius);
+                let x1 = (x + radius).min(w - 1);
+                let count = (x1 - x0 + 1) as f64;
+                tmp[row_off + x] = ((pref[x1 + 1] - pref[x0]) / count) as f32;
+            }
+        }
+        for x in 0..w {
+            pref[0] = 0.0;
+            for y in 0..h {
+                pref[y + 1] = pref[y] + f64::from(tmp[y * w + x]);
+            }
+            for y in 0..h {
+                let y0 = y.saturating_sub(radius);
+                let y1 = (y + radius).min(h - 1);
+                let count = (y1 - y0 + 1) as f64;
+                cur[y * w + x] = ((pref[y1 + 1] - pref[y0]) / count) as f32;
+            }
+        }
+    }
+    cur
 }
 
-/// O(W) memory, O(W*H) time 2D sliding-window background subtraction matching `WatermarkEnhancer`.
-fn enhance_local_window(
-    src: &ForensicsImage,
-    radius: usize,
-    gain: f64,
-    signal_unit: f64,
-    base_val: f64,
-    signal_fn: fn(i32, i32, i32) -> i32,
-) -> Vec<u8> {
+/// Estimates `(p50, p84, p988)` over `[-16.0, 64.0]` in O(N) time using a 4096-bin histogram.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::suboptimal_flops
+)]
+fn signal_percentiles(values: &[f32], weights: &[f32]) -> (f32, f32, f32) {
+    const BINS: usize = 4096;
+    const MIN_V: f32 = -16.0;
+    const SPAN_V: f32 = 80.0;
+    const SCALE: f32 = (BINS - 1) as f32 / SPAN_V;
+
+    let mut hist = vec![0_u64; BINS];
+    let mut total = 0_u64;
+    for (&v, &w) in values.iter().zip(weights) {
+        if w > 0.90 {
+            let bin = ((v - MIN_V) * SCALE).round().clamp(0.0, (BINS - 1) as f32) as usize;
+            hist[bin] += 1;
+            total += 1;
+        }
+    }
+    if total == 0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let at = |q: f64| -> f32 {
+        let target = ((total as f64) * q).ceil().max(1.0) as u64;
+        let mut acc = 0_u64;
+        for (idx, &count) in hist.iter().enumerate() {
+            acc += count;
+            if acc >= target {
+                return (idx as f32) / SCALE + MIN_V;
+            }
+        }
+        MIN_V + SPAN_V
+    };
+    (at(0.50), at(0.84), at(0.988))
+}
+
+/// Multi-scale anti-moire watermark isolator for camera photos and screenshots:
+/// 1. Suppresses high-frequency LCD RGB subpixel moire with a tight Gaussian pre-filter (`r_inner`).
+/// 2. Normalizes blue-excess chromaticity by luminance so screen white-balance and black body ink
+///    do not invert or bias local chroma.
+/// 3. Inpaints deep dark PDF text/chrome before estimating local paper background (`r_outer`),
+///    combining hidden blue chroma and semi-transparent visible watermark contrast onto crisp paper.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    clippy::suboptimal_flops
+)]
+fn enhance_chroma_watermark(src: &ForensicsImage) -> Vec<u8> {
     let w = src.width as usize;
     let h = src.height as usize;
+    let n = w * h;
+    let longer = w.max(h);
 
-    let mut row_signal = vec![0_i32; w];
-    let mut row_pref = vec![0_i64; w + 1];
-    let mut ring_rows = vec![vec![0_i64; w]; (2 * radius + 2).min(h + 1)];
-    let mut col_sums = vec![0_i64; w];
-    let mut col_counts = vec![0_i32; w];
-
-    let init_rows = radius.min(h);
-    for y in 0..init_rows {
-        fill_row_signal(
-            &src.rgba[y * w * 4..(y + 1) * w * 4],
-            &mut row_signal,
-            signal_fn,
-        );
-        let slot = y % ring_rows.len();
-        for x in 0..w {
-            let v = i64::from(row_signal[x]);
-            ring_rows[slot][x] = v;
-            col_sums[x] += v;
-            col_counts[x] += 1;
-        }
+    let mut luma = Vec::with_capacity(n);
+    let mut chroma_norm = Vec::with_capacity(n);
+    for px in src.rgba.as_chunks::<4>().0 {
+        let [r8, g8, b8] = composite_on_white(*px);
+        let r = f32::from(r8);
+        let g = f32::from(g8);
+        let b = f32::from(b8);
+        let y = 0.299 * r + 0.587 * g + 0.114 * b;
+        luma.push(y);
+        let denom = y.max(48.0);
+        chroma_norm.push((3.0 * (b - r) + (b - g)) * (220.0 / denom) * 0.25);
     }
 
-    let mut out = vec![0xFF_u8; src.rgba.len()];
-    let ring_len = ring_rows.len();
+    let r_inner = (longer / 950).min(6);
+    let r_halo = (longer / 250).clamp(3, 20);
+    let r_outer = (longer / 95).clamp(18, 56);
 
-    for y in 0..h {
-        let enter_y = y + radius;
-        if enter_y < h {
-            fill_row_signal(
-                &src.rgba[enter_y * w * 4..(enter_y + 1) * w * 4],
-                &mut row_signal,
-                signal_fn,
-            );
-            let slot = enter_y % ring_len;
-            for x in 0..w {
-                let v = i64::from(row_signal[x]);
-                ring_rows[slot][x] = v;
-                col_sums[x] += v;
-                col_counts[x] += 1;
+    let luma_fine = blur_box_passes(&luma, w, h, r_inner, 3);
+    let luma_paper = blur_box_passes(&luma_fine, w, h, r_outer, 3);
+
+    let mut raw_ink = vec![0.0_f32; n];
+    for i in 0..n {
+        let paper_y = luma_paper[i];
+        if paper_y < 95.0 {
+            raw_ink[i] = 1.0;
+        } else {
+            let ratio = luma_fine[i] / paper_y;
+            if ratio < 0.80 {
+                raw_ink[i] = ((0.80 - ratio) / 0.10).clamp(0.0, 1.0);
             }
-        }
-
-        if let Some(leave_y) = y.checked_sub(radius + 1) {
-            let slot = leave_y % ring_len;
-            for x in 0..w {
-                col_sums[x] -= ring_rows[slot][x];
-                col_counts[x] -= 1;
-            }
-        }
-
-        fill_row_signal(
-            &src.rgba[y * w * 4..(y + 1) * w * 4],
-            &mut row_signal,
-            signal_fn,
-        );
-        row_pref[0] = 0;
-        for x in 0..w {
-            row_pref[x + 1] = row_pref[x] + col_sums[x];
-        }
-
-        let dst_row = &mut out[y * w * 4..(y + 1) * w * 4];
-        for x in 0..w {
-            let x0 = x.saturating_sub(radius);
-            let x1 = (x + radius).min(w - 1);
-            let window_sum = row_pref[x1 + 1] - row_pref[x0];
-            let area = i64::from(col_counts[x]) * i64::try_from(x1 - x0 + 1).unwrap_or(1);
-            #[allow(clippy::cast_precision_loss)]
-            let local_mean = (window_sum as f64 * signal_unit) / (area.max(1) as f64);
-            let val = f64::from(row_signal[x]) * signal_unit;
-            let diff = -(val - local_mean);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let mapped = diff.mul_add(gain, base_val).round().clamp(0.0, 255.0) as u8;
-            let base_idx = x * 4;
-            dst_row[base_idx] = mapped;
-            dst_row[base_idx + 1] = mapped;
-            dst_row[base_idx + 2] = mapped;
-            dst_row[base_idx + 3] = 255;
         }
     }
+    let ink_tight = blur_box_passes(&raw_ink, w, h, r_inner + 2, 2);
+    let ink_wide = blur_box_passes(&raw_ink, w, h, r_halo, 3);
 
+    let chroma_fine = blur_box_passes(&chroma_norm, w, h, r_inner, 3);
+    let chroma_rough_bg = blur_box_passes(&chroma_fine, w, h, r_outer, 2);
+
+    let mut chroma_clean = vec![0.0_f32; n];
+    let mut luma_clean = vec![0.0_f32; n];
+    let mut wl_vec = vec![0.0_f32; n];
+    for i in 0..n {
+        let wc = (1.0 - 4.0 * ink_tight[i]).clamp(0.0, 1.0);
+        let wl = (1.0 - 12.0 * ink_wide[i]).clamp(0.0, 1.0);
+        wl_vec[i] = wl;
+        chroma_clean[i] = chroma_fine[i] * wc + chroma_rough_bg[i] * (1.0 - wc);
+        luma_clean[i] = luma_fine[i] * wl + luma_paper[i] * (1.0 - wl);
+    }
+    let chroma_bg = blur_box_passes(&chroma_clean, w, h, r_outer, 3);
+    let luma_bg = blur_box_passes(&luma_clean, w, h, r_outer, 3);
+
+    let mut sig = vec![0.0_f32; n];
+    for i in 0..n {
+        let wc = (1.0 - 4.0 * ink_tight[i]).clamp(0.0, 1.0);
+        let wl = wl_vec[i];
+        let c_band = (chroma_clean[i] - chroma_bg[i]) * wc;
+        let paper_y = luma_bg[i].max(48.0);
+        let l_drop = ((luma_bg[i] - luma_clean[i]) * (220.0 / paper_y)).max(0.0) * wl;
+        sig[i] = c_band + 0.50 * l_drop;
+    }
+
+    let (p50, p84, p988) = signal_percentiles(&sig, &wl_vec);
+    let floor = (p50 + 0.65 * (p84 - p50)).max(p50 + 1.0);
+    let ceil = (p50 + 0.90 * (p988 - p50)).max(floor + 4.0);
+    let span = (ceil - floor).max(4.0);
+
+    let mut out = vec![0xFF_u8; n * 4];
+    for i in 0..n {
+        let t = ((sig[i] - floor) / span).clamp(0.0, 1.0);
+        let s_curve = t * t * (3.0 - 2.0 * t);
+        let context_ink = if luma_paper[i] >= 95.0 {
+            raw_ink[i] * 26.0
+        } else {
+            16.0
+        };
+        let mapped = (252.0 - (s_curve * 236.0).max(context_ink))
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        let dst = i * 4;
+        out[dst] = mapped;
+        out[dst + 1] = mapped;
+        out[dst + 2] = mapped;
+    }
     out
 }
 
-fn fill_row_signal(src_row: &[u8], out: &mut [i32], signal_fn: fn(i32, i32, i32) -> i32) {
-    for (dst, px) in out.iter_mut().zip(src_row.as_chunks::<4>().0) {
-        // Transparent areas are evaluated as they would appear on a white page.
+/// Anti-moire Gaussian local illumination removal rendering dark ink and watermarks on clean paper.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    clippy::suboptimal_flops
+)]
+fn enhance_adaptive_background(src: &ForensicsImage) -> Vec<u8> {
+    let w = src.width as usize;
+    let h = src.height as usize;
+    let n = w * h;
+    let longer = w.max(h);
+
+    let mut luma = Vec::with_capacity(n);
+    for px in src.rgba.as_chunks::<4>().0 {
         let [r, g, b] = composite_on_white(*px);
-        *dst = signal_fn(i32::from(r), i32::from(g), i32::from(b));
+        luma.push((f32::from(r) * 77.0 + f32::from(g) * 150.0 + f32::from(b) * 29.0) / 256.0);
     }
+
+    let r_inner = (longer / 950).min(6);
+    let r_outer = (longer / 95).clamp(15, 56);
+    let fine = blur_box_passes(&luma, w, h, r_inner, 3);
+    let paper = blur_box_passes(&fine, w, h, r_outer, 3);
+
+    let mut out = vec![0xFF_u8; n * 4];
+    for i in 0..n {
+        let paper_y = paper[i].max(32.0);
+        let diff = (paper_y - fine[i]) * (215.0 / paper_y);
+        let mapped = (242.0 - diff * 10.0).round().clamp(0.0, 255.0) as u8;
+        let dst = i * 4;
+        out[dst] = mapped;
+        out[dst + 1] = mapped;
+        out[dst + 2] = mapped;
+    }
+    out
 }
 
 /// 8-bit luminance (`77 R + 150 G + 29 B`) of a pixel flattened onto white.
@@ -1030,70 +1122,51 @@ mod tests {
         assert_eq!(eq.rgba[0], eq.rgba[4]);
     }
 
-    /// Straightforward O(W*H*r^2) reference for the sliding-window local residual.
-    fn brute_force_local_window(
-        src: &ForensicsImage,
+    /// Straightforward O(W*H*r^2) reference for multi-pass separable box blur.
+    fn brute_force_box_passes(
+        src: &[f32],
+        w: usize,
+        h: usize,
         radius: usize,
-        gain: f64,
-        signal_unit: f64,
-        base_val: f64,
-        signal_fn: fn(i32, i32, i32) -> i32,
-    ) -> Vec<u8> {
-        let w = src.width as usize;
-        let h = src.height as usize;
-        let signal = |x: usize, y: usize| -> i32 {
-            let i = (y * w + x) * 4;
-            signal_fn(
-                i32::from(src.rgba[i]),
-                i32::from(src.rgba[i + 1]),
-                i32::from(src.rgba[i + 2]),
-            )
-        };
-        let mut out = vec![0xFF_u8; src.rgba.len()];
-        for y in 0..h {
-            for x in 0..w {
-                let (x0, x1) = (x.saturating_sub(radius), (x + radius).min(w - 1));
-                let (y0, y1) = (y.saturating_sub(radius), (y + radius).min(h - 1));
-                let mut sum = 0_i64;
-                for yy in y0..=y1 {
-                    for xx in x0..=x1 {
-                        sum += i64::from(signal(xx, yy));
+        passes: usize,
+    ) -> Vec<f32> {
+        let mut cur = src.to_vec();
+        for _ in 0..passes {
+            let mut horiz = vec![0.0_f32; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let (x0, x1) = (x.saturating_sub(radius), (x + radius).min(w - 1));
+                    let sum: f64 = (x0..=x1).map(|xx| f64::from(cur[y * w + xx])).sum();
+                    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                    {
+                        horiz[y * w + x] = (sum / ((x1 - x0 + 1) as f64)) as f32;
                     }
                 }
-                let area = i64::try_from((x1 - x0 + 1) * (y1 - y0 + 1)).unwrap();
-                #[allow(clippy::cast_precision_loss)]
-                let local_mean = (sum as f64 * signal_unit) / (area as f64);
-                let val = f64::from(signal(x, y)) * signal_unit;
-                let diff = -(val - local_mean);
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let mapped = diff.mul_add(gain, base_val).round().clamp(0.0, 255.0) as u8;
-                let i = (y * w + x) * 4;
-                out[i] = mapped;
-                out[i + 1] = mapped;
-                out[i + 2] = mapped;
-                out[i + 3] = 255;
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    let (y0, y1) = (y.saturating_sub(radius), (y + radius).min(h - 1));
+                    let sum: f64 = (y0..=y1).map(|yy| f64::from(horiz[yy * w + x])).sum();
+                    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                    {
+                        cur[y * w + x] = (sum / ((y1 - y0 + 1) as f64)) as f32;
+                    }
+                }
             }
         }
-        out
+        cur
     }
 
-    fn noisy_image(w: u32, h: u32, seed: u32) -> ForensicsImage {
+    fn noisy_plane(len: usize, seed: u32) -> Vec<f32> {
         let mut state = seed;
-        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-        for _ in 0..w * h {
-            for _ in 0..3 {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                rgba.push(u8::try_from(state % 256).unwrap());
-            }
-            rgba.push(255);
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            out.push(f32::from(u8::try_from(state % 256).unwrap()));
         }
-        ForensicsImage {
-            width: w,
-            height: h,
-            rgba,
-        }
+        out
     }
 
     #[test]
@@ -1109,23 +1182,68 @@ mod tests {
             (30, 1, 0x0000_0099),
             (1, 1, 0x0000_0001),
         ] {
-            let img = noisy_image(w, h, seed);
-            let chroma = enhance_image(&img, EnhanceMode::ChromaStegoExtract).unwrap();
-            let chroma_ref =
-                brute_force_local_window(&img, 18, 11.0, 0.25, 225.0, chroma_stego_signal);
-            assert_eq!(chroma.rgba, chroma_ref, "chroma {w}x{h}");
-
-            let adaptive = enhance_image(&img, EnhanceMode::AdaptiveBackgroundSubtract).unwrap();
-            let adaptive_ref = brute_force_local_window(
-                &img,
-                15,
-                9.0,
-                1.0 / 256.0,
-                128.0,
-                luminance_weighted_signal,
-            );
-            assert_eq!(adaptive.rgba, adaptive_ref, "adaptive {w}x{h}");
+            let plane = noisy_plane(w * h, seed);
+            let fast = blur_box_passes(&plane, w, h, 9, 3);
+            let reference = brute_force_box_passes(&plane, w, h, 9, 3);
+            for (a, b) in fast.iter().zip(&reference) {
+                assert!((a - b).abs() <= 1e-4, "{w}x{h}: {a} vs {b}");
+            }
         }
+    }
+
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn camera_photo_with_lcd_moire_and_black_body_text_isolates_watermarks_cleanly() {
+        // 1200x900 simulated camera photo of a cool-white LCD screen (205, 212, 236) with
+        // vertical RGB subpixel moire (period 3 px), dark body text, and a faint blue watermark.
+        let (w, h) = (1_200_u32, 900_u32);
+        let mut rgba = vec![255_u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let moire = match x % 3 {
+                    0 => [10_i16, -4, -8],
+                    1 => [-5, 9, -4],
+                    _ => [-5, -5, 12],
+                };
+                let mut r = 205 + moire[0];
+                let mut g = 212 + moire[1];
+                let mut b = 236 + moire[2];
+
+                // Dark PDF body text line (attenuates all channels multiplicatively by 0.25)
+                if (420..=436).contains(&y) && (120..=1_080).contains(&x) && (x % 22 < 14) {
+                    r /= 4;
+                    g /= 4;
+                    b /= 4;
+                }
+                // Faint hidden blue watermark band (`alpha ~ 18/255` of `[0, 70, 245]`)
+                if (200..=214).contains(&y) && (180..=1_020).contains(&x) {
+                    r -= 12;
+                    g -= 7;
+                    b += 2;
+                }
+                let idx = ((y * w + x) * 4) as usize;
+                rgba[idx] = u8::try_from(r.clamp(0, 255)).unwrap();
+                rgba[idx + 1] = u8::try_from(g.clamp(0, 255)).unwrap();
+                rgba[idx + 2] = u8::try_from(b.clamp(0, 255)).unwrap();
+                rgba[idx + 3] = 255;
+            }
+        }
+        let img = ForensicsImage {
+            width: w,
+            height: h,
+            rgba,
+        };
+        let enh = enhance_image(&img, EnhanceMode::ChromaStegoExtract).unwrap();
+        let paper = pixel(&enh, 600, 100)[0];
+        let wm = pixel(&enh, 600, 207)[0];
+        let body_ink = pixel(&enh, 600, 428)[0];
+
+        assert!(paper >= 240, "paper should stay crisp white, got {paper}");
+        assert!(wm <= 60, "watermark stroke should be dark, got {wm}");
+        assert!(
+            body_ink >= 200,
+            "black PDF body ink should stay faintly suppressed, got {body_ink}"
+        );
     }
 
     #[test]

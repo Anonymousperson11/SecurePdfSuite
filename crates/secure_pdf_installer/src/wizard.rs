@@ -23,7 +23,7 @@ use winui3::bootstrap::{MIN_RUNTIME_VERSION, bootstrap_runtime, exit_ui_thread};
 use winui3::controls::{
     ACCENT_TEXT, BG_CANVAS, TEXT_PRIMARY, TEXT_SECONDARY, add_grid_cols, brush_base, button,
     card_border, check_box, gl_auto, gl_px, gl_star, grid_rows, info_bar, pad, place_in_grid,
-    progress_bar, show_info, stack_v, text_block, text_box, uniform,
+    progress_bar, scroll_viewer_vertical, show_info, stack_v, text_block, text_box, uniform,
 };
 use winui3::dialog::show_confirm_dialog;
 use winui3::interop::{
@@ -369,7 +369,9 @@ fn build_options_card(ui: &WizardUi) -> windows_core::Result<Border> {
     col.Children()?.Append(&ui.status_lbl)?;
     col.Children()?.Append(&ui.progress)?;
 
-    card.SetChild(&col)?;
+    let scroller = scroll_viewer_vertical()?;
+    scroller.SetContent(&col)?;
+    card.SetChild(&scroller)?;
     Ok(card)
 }
 

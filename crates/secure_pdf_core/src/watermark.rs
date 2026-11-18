@@ -57,39 +57,40 @@ pub struct TextLayerStyle {
 }
 
 impl TextLayerStyle {
-    /// Visible watermark: dark slate `ARGB(34, 15, 23, 42)` with a light shadow, 16 DIP bold.
+    /// Visible watermark: subtle slate `ARGB(18, 30, 41, 59)` with a soft shadow, 16 DIP bold.
     #[must_use]
     pub fn visible(dpi_scale: f64) -> Self {
         let s = scale_factor(dpi_scale);
         Self {
             font_px: scaled_px(16.0, s),
-            color_rgb: [15, 23, 42],
-            alpha: 34,
+            color_rgb: [30, 41, 59],
+            alpha: 18,
             shadow_rgb: [248, 250, 252],
-            shadow_alpha: 18,
+            shadow_alpha: 8,
             shadow_offset_px: s,
-            min_step_x_px: 310.0 * s,
-            gap_x_px: 110.0 * s,
-            step_y_px: 170.0 * s,
+            min_step_x_px: 340.0 * s,
+            gap_x_px: 140.0 * s,
+            step_y_px: 210.0 * s,
             angle_deg: -26.0,
         }
     }
 
-    /// Hidden trace watermark: low-alpha blue `ARGB(18, 0, 70, 245)`; barely changes luminance
-    /// but leaves a `(B - R)` chroma signal that survives re-photographing and JPEG compression.
+    /// Hidden trace watermark: near-isoluminant cyan-blue `ARGB(10, 0, 232, 255)` with no shadow;
+    /// keeps green/blue at paper level (`ΔY ≈ 1.4%`, imperceptible to normal reading) while
+    /// preserving a clean `(B - R)` chroma signature for camera and screenshot forensics.
     #[must_use]
     pub fn hidden(dpi_scale: f64) -> Self {
         let s = scale_factor(dpi_scale);
         Self {
             font_px: scaled_px(18.0, s),
-            color_rgb: [0, 70, 245],
-            alpha: 18,
-            shadow_rgb: [240, 246, 255],
-            shadow_alpha: 10,
-            shadow_offset_px: s,
-            min_step_x_px: 310.0 * s,
-            gap_x_px: 75.0 * s,
-            step_y_px: 108.0 * s,
+            color_rgb: [0, 232, 255],
+            alpha: 10,
+            shadow_rgb: [255, 255, 255],
+            shadow_alpha: 0,
+            shadow_offset_px: 0.0,
+            min_step_x_px: 330.0 * s,
+            gap_x_px: 90.0 * s,
+            step_y_px: 132.0 * s,
             angle_deg: -26.0,
         }
     }
@@ -486,16 +487,16 @@ pub const MICRODOT_TILE_W: usize = 144;
 /// Microdot tile height in grid units.
 pub const MICRODOT_TILE_H: usize = 112;
 
-const ANCHOR_SIZE: usize = 6;
+const ANCHOR_SIZE: usize = 4;
 const ANCHORS: [(usize, usize); 2] = [(4, 4), (14, 4)];
-const DOT_SIZE: usize = 5;
+const DOT_SIZE: usize = 3;
 const DOT_PITCH: usize = 10;
 const DOT_ORIGIN: (usize, usize) = (8, 18);
 /// Eight payload rows plus one CRC-8 row.
 const DOT_ROWS: usize = TRACE_PAYLOAD_LEN + 1;
-/// Straight microdot colour `ARGB(14, 0, 40, 220)` (v1.x `MicroDotBrush`).
-const MICRODOT_RGB: [u8; 3] = [0, 40, 220];
-const MICRODOT_ALPHA: u8 = 14;
+/// Near-isoluminant cyan-blue microdot colour `ARGB(7, 0, 235, 255)` (`ΔY < 1%` on white).
+const MICRODOT_RGB: [u8; 3] = [0, 235, 255];
+const MICRODOT_ALPHA: u8 = 7;
 
 /// Packs IPv4 + Unix seconds into the 8-byte trace payload (v1.x `BuildCompactTraceBytes`).
 /// An unparsable address is encoded as `0.0.0.0`.
@@ -638,7 +639,7 @@ pub struct MicrodotDecode {
 }
 
 /// Minimum anchor-over-background chroma lift accepted as a real matrix (8-bit units).
-const MIN_MICRODOT_SIGNAL: f32 = 3.0;
+const MIN_MICRODOT_SIGNAL: f32 = 2.2;
 /// Number of best-scoring alignments tried per scale.
 const ALIGNMENT_CANDIDATES: usize = 12;
 
@@ -916,8 +917,8 @@ mod tests {
         assert_eq!(v1.font_px, 16);
         assert_eq!(v2.font_px, 32);
         assert!(2.0_f32.mul_add(-v1.step_y_px, v2.step_y_px).abs() < 0.01);
-        // Dark slate at alpha 34 (v1.x `VisiblePrimaryBrush`), not a pale tint.
-        assert_eq!((v1.color_rgb, v1.alpha), ([15, 23, 42], 34));
+        // Subtle slate at alpha 18, legible without obscuring document text.
+        assert_eq!((v1.color_rgb, v1.alpha), ([30, 41, 59], 18));
         let hidden = TextLayerStyle::hidden(1.5);
         assert_eq!(hidden.font_px, 27);
         assert!(hidden.color_rgb[2] > hidden.color_rgb[0] + 200);
@@ -957,27 +958,27 @@ mod tests {
         let page = vec![255_u8; w * h * 4];
         let shown = composite_overlay_over_page(&page, &overlay);
 
-        // Fully covered glyph pixels drop a white page by alpha * (255 - colour) / 255 ≈ 30 levels.
+        // Fully covered glyph pixels drop a white page by alpha * (255 - colour) / 255 ≈ 16 levels.
         let darkest = shown.as_chunks::<4>().0.iter().map(|p| p[0]).min().unwrap();
-        assert!(darkest <= 255 - 24, "darkest red channel {darkest}");
+        assert!(darkest <= 255 - 14, "darkest red channel {darkest}");
         let marked = shown
             .as_chunks::<4>()
             .0
             .iter()
-            .filter(|p| p[0] < 245)
+            .filter(|p| p[0] < 248)
             .count();
-        assert!(marked > 1_500, "only {marked} visibly marked pixels");
+        assert!(marked > 1_000, "only {marked} visibly marked pixels");
         // Text must appear in all four quadrants (tiled), not once.
         for (qx, qy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
             let mut hits = 0;
             for y in (qy * h / 2)..((qy + 1) * h / 2) {
                 for x in (qx * w / 2)..((qx + 1) * w / 2) {
-                    if shown[(y * w + x) * 4] < 245 {
+                    if shown[(y * w + x) * 4] < 248 {
                         hits += 1;
                     }
                 }
             }
-            assert!(hits > 100, "quadrant ({qx},{qy}) has {hits} marked pixels");
+            assert!(hits > 60, "quadrant ({qx},{qy}) has {hits} marked pixels");
         }
         assert!(paint_text_layer(&mut overlay[..8], w, h, "x", &style).is_err());
     }
@@ -1070,7 +1071,7 @@ mod tests {
             assert_eq!(found.unit_px, unit);
             assert_eq!(found.payload.ipv4, Ipv4Addr::new(192, 168, 31, 207));
             assert_eq!(found.payload.unix_seconds, 1_794_825_045);
-            assert!(found.signal >= 8.0, "signal {}", found.signal);
+            assert!(found.signal >= 4.0, "signal {}", found.signal);
         }
     }
 
@@ -1159,6 +1160,6 @@ mod tests {
         assert_eq!(found.unit_px, 2);
         assert_eq!(found.payload.ipv4, Ipv4Addr::new(172, 20, 10, 5));
         assert_eq!(found.payload.unix_seconds, 1_794_980_554);
-        assert!(found.signal >= 9.0, "signal {}", found.signal);
+        assert!(found.signal >= 4.0, "signal {}", found.signal);
     }
 }

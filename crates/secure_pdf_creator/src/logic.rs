@@ -766,13 +766,24 @@ pub fn cap_preview_dimensions(width: u32, height: u32, max_side: u32) -> (u32, u
     (w, h)
 }
 
-/// Downsamples a [`ForensicsImage`] for safe XAML preview allocation and converts it to
-/// premultiplied `BGRA8` (colour channels scaled by alpha, as `WriteableBitmap` expects).
+/// Downsamples a [`ForensicsImage`] for safe XAML preview allocation using area-averaging and
+/// converts it to premultiplied `BGRA8` (colour channels scaled by alpha, as `WriteableBitmap` expects).
 #[must_use]
 pub fn forensics_preview_bgra8(img: &ForensicsImage) -> (u32, u32, Vec<u8>) {
     let (tw, th) = cap_preview_dimensions(img.width, img.height, MAX_PREVIEW_SIDE);
     if tw == img.width && th == img.height {
         return (tw, th, img.to_bgra8());
+    }
+    if let Some(raw) = image::RgbaImage::from_raw(img.width, img.height, img.rgba.clone()) {
+        let thumb = image::DynamicImage::ImageRgba8(raw)
+            .thumbnail_exact(tw, th)
+            .into_rgba8()
+            .into_raw();
+        let mut bgra = Vec::with_capacity(thumb.len());
+        for px in thumb.as_chunks::<4>().0 {
+            bgra.extend_from_slice(&rgba_to_premultiplied_bgra(*px));
+        }
+        return (tw, th, bgra);
     }
     let sw = img.width as usize;
     let sh = img.height as usize;
