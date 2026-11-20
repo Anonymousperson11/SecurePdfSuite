@@ -1,5 +1,4 @@
 [build]
-rustc-wrapper = "sccache"
 target = "x86_64-pc-windows-msvc"
 
 [env]

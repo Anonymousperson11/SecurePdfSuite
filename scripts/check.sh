@@ -13,11 +13,16 @@ cd "$ROOT"
 # shellcheck source=scripts/build-env.sh
 source "$ROOT/scripts/build-env.sh"
 
+PYTHON_BIN="python3"
+if ! python3 -c "import sys" >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+fi
+
 echo "==> [1/7] Formatting (cargo fmt)"
 cargo fmt --all -- --check
 
 echo "==> [2/7] Third-party notices are in sync with Cargo.lock"
-python3 scripts/gen-notices.py --check
+"$PYTHON_BIN" scripts/gen-notices.py --check
 
 echo "==> [3/7] Dependency licences, bans and advisories (cargo deny)"
 if [ "${DENY_OFFLINE:-0}" = "1" ]; then
@@ -35,7 +40,7 @@ if [ "$USE_XWIN" -eq 1 ]; then
     # runner hangs under WSL2 /init.
     TEST_EXES="$(
         cargo_win test --workspace --no-run --message-format=json \
-        | python3 -c '
+        | "$PYTHON_BIN" -c '
 import json, sys
 seen = set()
 for line in sys.stdin:

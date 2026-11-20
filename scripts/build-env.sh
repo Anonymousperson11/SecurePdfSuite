@@ -10,6 +10,7 @@ export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 TARGET_TRIPLE="x86_64-pc-windows-msvc"
 
 if command -v sccache >/dev/null 2>&1; then
+    export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
     sccache --start-server </dev/null >/dev/null 2>&1 || true
 fi
 

@@ -1,0 +1,14 @@
+# Keep Rust sources and Unix scripts LF across Windows/Linux checkouts so
+# `cargo fmt --check` (newline_style = "Unix") and bash scripts never fail on CRLF.
+*.rs text eol=lf
+*.toml text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.manifest text eol=lf
+
+# Windows Notepad expects CRLF in THIRD-PARTY-NOTICES.txt; batch scripts require CRLF.
+assets/THIRD-PARTY-NOTICES.txt text eol=crlf
+*.bat text eol=crlf
